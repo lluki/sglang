@@ -7,6 +7,36 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
+_STORAGE_LIMIT_UNITS = {"mb": 1024**2, "gb": 1024**3, "tb": 1024**4}
+
+
+def parse_storage_limit(value) -> int:
+    """Strictly-positive bytes int, or '<N>mb|gb|tb' (case-insensitive)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        result = value
+    elif isinstance(value, str):
+        s = value.strip().lower()
+        result = None
+        for unit, mult in _STORAGE_LIMIT_UNITS.items():
+            if s.endswith(unit):
+                num = s[: -len(unit)].strip()
+                if not num:
+                    raise ValueError(
+                        f"invalid storage_limit: missing number before {unit!r}"
+                    )
+                result = int(num) * mult
+                break
+        if result is None:
+            result = int(s)
+    else:
+        raise ValueError(f"invalid storage_limit: {value!r}")
+    if result <= 0:
+        raise ValueError(
+            f"invalid storage_limit: must be > 0, got {result} (from {value!r})"
+        )
+    return result
+
+
 class NixlBackendConfig:
     """Handles NIXL backend configurations"""
 
@@ -22,6 +52,17 @@ class NixlBackendConfig:
                 {'param1': 'value1', 'param2': 'value2', ...}
         """
         self.config = config or {}
+
+    def get_storage_limit_bytes(self) -> Optional[int]:
+        raw = self.config.get("storage_limit")
+        if raw is None and isinstance(self.config.get("plugin"), dict):
+            for plugin_cfg in self.config["plugin"].values():
+                if isinstance(plugin_cfg, dict) and "storage_limit" in plugin_cfg:
+                    raw = plugin_cfg["storage_limit"]
+                    break
+        if raw is None:
+            return None
+        return parse_storage_limit(raw)
 
     def get_use_direct_io(self) -> bool:
         """Return True if O_DIRECT should be requested when opening files.

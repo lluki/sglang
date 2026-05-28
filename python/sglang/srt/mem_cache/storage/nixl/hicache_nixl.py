@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import uuid
 from typing import Any, List, Optional
@@ -48,6 +49,8 @@ class HiCacheNixl(HiCacheStorage):
 
         use_direct_io = nixlconfig.get_use_direct_io()
 
+        self.storage_limit_bytes = nixlconfig.get_storage_limit_bytes()
+
         # Might be better to be unified across HiCache backends and moved to HiCacheController
         file_path = envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
         self.file_manager = (
@@ -73,6 +76,18 @@ class HiCacheNixl(HiCacheStorage):
             self.config_suffix = f"_{model_name}"
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+
+        # storage_limit is the TOTAL across tp ranks; each rank polices total // tp_size.
+        # MLA writes only from rank 0, so it gets the full limit.
+        if self.storage_limit_bytes is None:
+            self._per_rank_limit_bytes: Optional[int] = None
+        elif self.is_mla_model:
+            self._per_rank_limit_bytes = self.storage_limit_bytes
+        else:
+            self._per_rank_limit_bytes = max(
+                self.storage_limit_bytes // max(tp_size, 1), 1
+            )
+        self._bytes_written: int = 0
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
@@ -227,6 +242,9 @@ class HiCacheNixl(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+
+        if self._per_rank_limit_bytes is not None and self.file_manager is not None:
+            self._scan_disk_usage()
 
         # enable zero-copy automatically if mem layout is page_first or page_first_direct
         self.is_zero_copy = self.mem_pool_host.layout in [
@@ -536,6 +554,84 @@ class HiCacheNixl(HiCacheStorage):
 
         return self._batch_get_postprocess(host_indices, results)
 
+    _FIFO_HIGH_WATERMARK = 0.8  # trigger reclaim at 80% of per-rank limit
+    _FIFO_RECLAIM_FRACTION = 0.2  # free 20% of current usage per reclaim
+
+    def _scan_disk_usage(self) -> List[tuple]:
+        """Scan this rank's files; re-sync _bytes_written; return (ctime_ns, path, size)."""
+        base = self.file_manager.base_dir
+        suffix = self.config_suffix
+        entries: List[tuple] = []
+        total = 0
+        try:
+            with os.scandir(base) as it:
+                for e in it:
+                    if not e.is_file():
+                        continue
+                    # Zero-copy non-MLA writes per-page <key><suffix>_k /
+                    # <key><suffix>_v files; everything else ends in <suffix>.
+                    if suffix and not (
+                        e.name.endswith(suffix)
+                        or e.name.endswith(suffix + "_k")
+                        or e.name.endswith(suffix + "_v")
+                    ):
+                        continue
+                    st = e.stat()
+                    entries.append((st.st_ctime_ns, e.path, st.st_size))
+                    total += st.st_size
+        except FileNotFoundError:
+            pass
+        self._bytes_written = total
+        return entries
+
+    def _reclaim(self, incoming_bytes: int = 0) -> bool:
+        """FIFO reclaim: re-sync counter, delete oldest until 20% of usage
+        is freed or `incoming_bytes` fits the per-rank/FS headroom (whichever
+        is more). Returns True if any bytes were freed (caller may retry)."""
+        if self.file_manager is None:
+            return False
+        entries = self._scan_disk_usage()
+
+        headroom: Optional[int] = None
+        if self._per_rank_limit_bytes is not None:
+            high_water = int(self._per_rank_limit_bytes * self._FIFO_HIGH_WATERMARK)
+            headroom = high_water - self._bytes_written
+        try:
+            st = os.statvfs(self.file_manager.base_dir)
+            fs_free = st.f_bavail * st.f_frsize
+            headroom = fs_free if headroom is None else min(headroom, fs_free)
+        except OSError as e:
+            logger.debug("HiCacheNixl: statvfs failed: %s", e)
+        if headroom is None or incoming_bytes <= headroom:
+            return False
+
+        free_target = max(
+            int(self._bytes_written * self._FIFO_RECLAIM_FRACTION),
+            incoming_bytes - headroom,
+        )
+        if free_target <= 0:
+            return False
+
+        entries.sort(key=lambda t: t[0])
+        freed = 0
+        for _, path, size in entries:
+            if freed >= free_target:
+                break
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                freed += size
+                self._bytes_written = max(0, self._bytes_written - size)
+                continue
+            except OSError as e:
+                logger.warning(
+                    "HiCacheNixl FIFO evict: failed to unlink %s: %s", path, e
+                )
+                continue
+            freed += size
+            self._bytes_written = max(0, self._bytes_written - size)
+        return freed > 0
+
     def batch_set_v1(
         self,
         keys: List[str],
@@ -559,8 +655,35 @@ class HiCacheNixl(HiCacheStorage):
         if not key_strs or not host_buffers:
             return [False] * len(keys)
 
+        new_bytes = sum(s for _, s in host_buffers)
+        fifo_on = self.file_manager is not None
+        if fifo_on:
+            if (
+                self._per_rank_limit_bytes is not None
+                and new_bytes > self._per_rank_limit_bytes
+            ):
+                logger.warning(
+                    "HiCacheNixl: rejecting batch_set_v1 -- batch size %d B exceeds "
+                    "per-rank storage_limit %d B; cache untouched",
+                    new_bytes,
+                    self._per_rank_limit_bytes,
+                )
+                return [False] * len(keys)
+            # Always run _reclaim before the write. The statvfs branch fires
+            # even without a configured storage_limit, so a write that would
+            # ENOSPC gets room beforehand. NIXL/libaio does not surface
+            # ENOSPC up the stack (transfer "succeeds" with a partial file),
+            # so a post-write retry alone is unreliable.
+            if self._reclaim(new_bytes):
+                logger.info("HiCacheNixl: FIFO reclamation freed room before set")
+
         start_time = time.perf_counter()
         results = self._batch_xfer(keys, key_strs, host_buffers, "WRITE")
+
+        if not any(results) and self._reclaim(new_bytes):
+            logger.info("HiCacheNixl: retrying batch_set_v1 after FIFO reclamation")
+            results = self._batch_xfer(keys, key_strs, host_buffers, "WRITE")
+
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         self._log_xfer_stats(
             "batch_set_v1",
@@ -569,5 +692,9 @@ class HiCacheNixl(HiCacheStorage):
             [s for _, s in host_buffers],
             elapsed_ms,
         )
+
+        # Best-effort; _reclaim re-syncs from disk if the counter drifts.
+        if fifo_on and any(results):
+            self._bytes_written += new_bytes
 
         return results

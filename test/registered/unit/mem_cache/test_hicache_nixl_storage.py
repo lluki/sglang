@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -207,6 +207,81 @@ class MinioFixture:
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
 
+def _make_storage_config(extra_config, *, tp_size=2):
+    return HiCacheStorageConfig(
+        tp_rank=0,
+        tp_size=tp_size,
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        is_mla_model=False,
+        is_page_first_layout=False,
+        model_name="test_model",
+        enable_storage_metrics=False,
+        extra_config=extra_config,
+    )
+
+
+def _build_hicache_or_skip(test_case, storage_config, file_path):
+    try:
+        return HiCacheNixl(storage_config=storage_config, file_path=file_path)
+    except ImportError:
+        test_case.skipTest("NIXL not available")
+
+
+_POSIX_BUFFERED = {"plugin": {"posix": {"active": True}}, "use_direct_io": False}
+_POSIX_DEFAULT = {"plugin": {"posix": {"active": True}}}
+
+# Geometry shared by the FIFO + ENOSPC fixtures.
+_TEST_PAGE_SIZE = 2
+_TEST_LAYER_NUM = 2
+_TEST_HEAD_NUM = 2
+_TEST_HEAD_DIM = 4
+
+
+def _probe_page_bytes() -> int:
+    """On-disk page size from MockMemPoolHost (tracks mock's dtype)."""
+    probe = MockMemPoolHost(
+        is_zero_copy_mode=False,
+        page_size=_TEST_PAGE_SIZE,
+        layer_num=_TEST_LAYER_NUM,
+        head_num=_TEST_HEAD_NUM,
+        head_dim=_TEST_HEAD_DIM,
+        num_pages=1,
+    )
+    sample = probe.get_dummy_flat_data_page()
+    return sample.numel() * sample.element_size()
+
+
+_TEST_PAGE_BYTES = _probe_page_bytes()
+_TEST_TP_SIZE = 2
+_TEST_KEY_SUFFIX = f"_test_model_0_{_TEST_TP_SIZE}"
+
+
+def _total_limit(per_rank_bytes: int) -> int:
+    """Tests think in 'per-rank pages'; storage_limit is total across ranks."""
+    return per_rank_bytes * _TEST_TP_SIZE
+
+
+def _make_posix_hicache_with_mock_pool(test_case, file_path, *, storage_limit=None):
+    extra = dict(_POSIX_BUFFERED)
+    if storage_limit is not None:
+        extra["storage_limit"] = storage_limit
+    hicache = _build_hicache_or_skip(test_case, _make_storage_config(extra), file_path)
+    mock_host = MockMemPoolHost(
+        is_zero_copy_mode=False,
+        page_size=_TEST_PAGE_SIZE,
+        layer_num=_TEST_LAYER_NUM,
+        head_num=_TEST_HEAD_NUM,
+        head_dim=_TEST_HEAD_DIM,
+        num_pages=4,
+    )
+    hicache.register_mem_pool_host(mock_host)
+    hicache.is_zero_copy = False
+    return hicache, mock_host
+
+
 class TestNixlUnified(CustomTestCase):
     """Unified test suite for all NIXL components."""
 
@@ -214,35 +289,8 @@ class TestNixlUnified(CustomTestCase):
         """Set up test environment."""
         self.test_dir = "/tmp/test_nixl_unified"
         os.makedirs(self.test_dir, exist_ok=True)
-
-        # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
-        # tensors that do not satisfy the sector-alignment constraints required
-        # by O_DIRECT. O_DIRECT-specific behaviour is exercised in
-        # TestNixlDirectIO below.
-        self.storage_config = HiCacheStorageConfig(
-            tp_rank=0,
-            tp_size=2,
-            pp_rank=0,
-            pp_size=1,
-            attn_cp_rank=0,
-            attn_cp_size=1,
-            is_mla_model=False,
-            is_page_first_layout=False,
-            model_name="test_model",
-            enable_storage_metrics=False,
-            extra_config={
-                "plugin": {"posix": {"active": True}},
-                "use_direct_io": False,
-            },
-        )
-
-        try:
-            self.hicache = HiCacheNixl(
-                storage_config=self.storage_config,
-                file_path=self.test_dir,
-            )
-        except ImportError:
-            self.skipTest("NIXL not available, skipping NIXL storage tests")
+        self.storage_config = _make_storage_config(_POSIX_BUFFERED)
+        self.hicache = _build_hicache_or_skip(self, self.storage_config, self.test_dir)
 
     def tearDown(self):
         """Clean up test directories."""
@@ -422,18 +470,8 @@ class TestNixlUnified(CustomTestCase):
         minio.start()
         self.addCleanup(minio.stop)
 
-        obj_config = HiCacheStorageConfig(
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
-            attn_cp_rank=0,
-            attn_cp_size=1,
-            is_mla_model=False,
-            is_page_first_layout=False,
-            model_name="test_model",
-            enable_storage_metrics=False,
-            extra_config={
+        obj_config = _make_storage_config(
+            {
                 "plugin": {
                     "obj": {
                         "active": True,
@@ -445,6 +483,7 @@ class TestNixlUnified(CustomTestCase):
                     }
                 }
             },
+            tp_size=1,
         )
         try:
             return HiCacheNixl(storage_config=obj_config, file_path="")
@@ -666,6 +705,402 @@ class TestNixlUnified(CustomTestCase):
         )
 
 
+class TestNixlFifoEviction(CustomTestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="nixl_fifo_")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _make_hicache(self, storage_limit=None):
+        return _make_posix_hicache_with_mock_pool(
+            self, self.test_dir, storage_limit=storage_limit
+        )
+
+    def _set_one(self, hicache, key: str):
+        indices = torch.arange(_TEST_PAGE_SIZE, dtype=torch.int64)
+        return hicache.batch_set_v1([key], indices)
+
+    def _file_for(self, key: str) -> str:
+        return os.path.join(self.test_dir, key + _TEST_KEY_SUFFIX)
+
+    def test_fifo_evicts_oldest_when_limit_exceeded(self):
+        # Cap = n+1 pages so writing the n+1th key crosses 80% and evicts only the oldest.
+        n = 4
+        per_rank = (n + 1) * _TEST_PAGE_BYTES
+        limit = _total_limit(per_rank)
+        hicache, _ = self._make_hicache(storage_limit=limit)
+        try:
+            for i in range(n):
+                self.assertTrue(
+                    all(self._set_one(hicache, f"k{i}")),
+                    f"baseline set k{i} failed",
+                )
+                time.sleep(0.01)
+            for i in range(n):
+                self.assertTrue(
+                    os.path.exists(self._file_for(f"k{i}")),
+                    f"baseline k{i} missing before eviction",
+                )
+
+            self.assertTrue(
+                all(self._set_one(hicache, f"k{n}")),
+                f"set k{n} should succeed after evicting k0",
+            )
+
+            self.assertFalse(
+                os.path.exists(self._file_for("k0")),
+                "oldest key k0 should have been evicted",
+            )
+            self.assertTrue(
+                os.path.exists(self._file_for(f"k{n}")),
+                f"new key k{n} should be present",
+            )
+            for i in range(1, n):
+                self.assertTrue(
+                    os.path.exists(self._file_for(f"k{i}")),
+                    f"key k{i} should still be present (only oldest evicted)",
+                )
+
+            total = sum(
+                os.path.getsize(os.path.join(self.test_dir, f))
+                for f in os.listdir(self.test_dir)
+            )
+            self.assertLessEqual(
+                total,
+                per_rank,
+                f"total on-disk {total} exceeds per-rank limit {per_rank}",
+            )
+        finally:
+            hicache.close()
+
+    def test_no_limit_means_no_eviction(self):
+        n = 4
+        hicache, _ = self._make_hicache(storage_limit=None)
+        try:
+            for i in range(n + 1):
+                self.assertTrue(
+                    all(self._set_one(hicache, f"k{i}")),
+                    f"set k{i} failed",
+                )
+                time.sleep(0.005)
+            for i in range(n + 1):
+                self.assertTrue(
+                    os.path.exists(self._file_for(f"k{i}")),
+                    f"k{i} missing -- unlimited mode must not evict",
+                )
+        finally:
+            hicache.close()
+
+    def test_multi_evict_when_batch_larger_than_single_entry(self):
+        n = 4
+        per_rank = (n + 1) * _TEST_PAGE_BYTES
+        limit = _total_limit(per_rank)
+        hicache, _ = self._make_hicache(storage_limit=limit)
+        try:
+            for i in range(n):
+                self.assertTrue(all(self._set_one(hicache, f"k{i}")), f"set k{i}")
+                time.sleep(0.01)
+
+            new_keys = ["m0", "m1", "m2"]
+            indices = torch.arange(_TEST_PAGE_SIZE * len(new_keys), dtype=torch.int64)
+            self.assertTrue(
+                all(hicache.batch_set_v1(new_keys, indices)),
+                "multi-key batch_set should succeed after multi-evict",
+            )
+
+            for evicted in ("k0", "k1", "k2"):
+                self.assertFalse(
+                    os.path.exists(self._file_for(evicted)),
+                    f"{evicted} should have been evicted",
+                )
+            self.assertTrue(
+                os.path.exists(self._file_for("k3")),
+                "k3 (newest of the old set) should remain",
+            )
+            for new_key in new_keys:
+                self.assertTrue(
+                    os.path.exists(self._file_for(new_key)),
+                    f"new key {new_key} should be present",
+                )
+            total = sum(
+                os.path.getsize(os.path.join(self.test_dir, f))
+                for f in os.listdir(self.test_dir)
+            )
+            self.assertLessEqual(total, per_rank)
+        finally:
+            hicache.close()
+
+    def test_batch_larger_than_limit_rejected_cache_untouched(self):
+        # Cap = 1.5 pages: 1-page seed fits, 2-page batch is rejected as oversized.
+        per_rank = _TEST_PAGE_BYTES + _TEST_PAGE_BYTES // 2
+        limit = _total_limit(per_rank)
+        hicache, _ = self._make_hicache(storage_limit=limit)
+        try:
+            self.assertTrue(all(self._set_one(hicache, "keep")), "seed set")
+            seed_path = self._file_for("keep")
+            self.assertTrue(os.path.exists(seed_path))
+            seed_mtime = os.path.getmtime(seed_path)
+
+            indices = torch.arange(2 * _TEST_PAGE_SIZE, dtype=torch.int64)
+            results = hicache.batch_set_v1(["big0", "big1"], indices)
+            self.assertEqual(
+                results,
+                [False, False],
+                "oversized batch must be rejected (all False)",
+            )
+
+            self.assertTrue(
+                os.path.exists(seed_path),
+                "existing file must not be evicted on rejected batch",
+            )
+            self.assertEqual(
+                os.path.getmtime(seed_path),
+                seed_mtime,
+                "existing file should not have been rewritten",
+            )
+            self.assertFalse(os.path.exists(self._file_for("big0")))
+            self.assertFalse(os.path.exists(self._file_for("big1")))
+        finally:
+            hicache.close()
+
+    def test_eviction_order_is_ctime_not_name(self):
+        n = 4
+        per_rank = (n + 1) * _TEST_PAGE_BYTES
+        limit = _total_limit(per_rank)
+        hicache, _ = self._make_hicache(storage_limit=limit)
+        try:
+            order = ["z_first", "a_second", "m_third", "b_fourth"]
+            for k in order:
+                self.assertTrue(all(self._set_one(hicache, k)), f"set {k}")
+                time.sleep(0.01)
+            self.assertTrue(all(self._set_one(hicache, "newest")), "set newest")
+            self.assertFalse(
+                os.path.exists(self._file_for("z_first")),
+                "oldest by ctime (z_first) should be evicted, not 'a_second' "
+                "which is lexically first",
+            )
+            for survivor in ("a_second", "m_third", "b_fourth", "newest"):
+                self.assertTrue(
+                    os.path.exists(self._file_for(survivor)),
+                    f"{survivor} should still be present",
+                )
+        finally:
+            hicache.close()
+
+    def test_counter_resyncs_on_external_deletion(self):
+        # External deletion -> next reclaim syncs the counter, no spurious eviction.
+        n = 4
+        per_rank = (n + 1) * _TEST_PAGE_BYTES
+        limit = _total_limit(per_rank)
+        hicache, _ = self._make_hicache(storage_limit=limit)
+        try:
+            for i in range(n):
+                self.assertTrue(all(self._set_one(hicache, f"k{i}")), f"set k{i}")
+                time.sleep(0.01)
+            # Externally remove k1 and k2.
+            os.unlink(self._file_for("k1"))
+            os.unlink(self._file_for("k2"))
+            # Triggers reclaim (counter still at high-water), but scan resync should evict nothing.
+            self.assertTrue(all(self._set_one(hicache, "kN")), "set kN")
+            self.assertTrue(
+                os.path.exists(self._file_for("k0")),
+                "k0 must survive: counter resync should have shown room",
+            )
+            self.assertTrue(
+                os.path.exists(self._file_for("k3")),
+                "k3 must survive",
+            )
+            self.assertTrue(os.path.exists(self._file_for("kN")))
+        finally:
+            hicache.close()
+
+    def test_other_rank_files_in_dir_are_ignored(self):
+        # Seed a foreign-suffix file (simulates a peer tp_rank's data).
+        n = 4
+        per_rank = (n + 1) * _TEST_PAGE_BYTES
+        limit = _total_limit(per_rank)
+        foreign = os.path.join(self.test_dir, "foreign_test_model_1_2")
+        with open(foreign, "wb") as f:
+            f.write(b"\0" * _TEST_PAGE_BYTES)
+        hicache, _ = self._make_hicache(storage_limit=limit)
+        try:
+            for i in range(n):
+                self.assertTrue(all(self._set_one(hicache, f"k{i}")), f"set k{i}")
+                time.sleep(0.01)
+            # Force one eviction by writing one more key.
+            self.assertTrue(all(self._set_one(hicache, "kN")), "set kN")
+            self.assertTrue(
+                os.path.exists(foreign),
+                "another rank's file must not be evicted by this rank's FIFO",
+            )
+            self.assertFalse(
+                os.path.exists(self._file_for("k0")),
+                "this rank's oldest (k0) should have been evicted",
+            )
+        finally:
+            hicache.close()
+
+
+def _mount_cmd_prefix() -> Optional[list]:
+    """Return the argv prefix to invoke mount/umount, or None if unavailable."""
+    if not shutil.which("mount"):
+        return None
+    if os.geteuid() == 0:
+        return []
+    if shutil.which("sudo"):
+        return ["sudo", "-n"]
+    return None
+
+
+def _try_mount_tmpfs(path: str, size_bytes: int) -> Optional[str]:
+    prefix = _mount_cmd_prefix()
+    if prefix is None:
+        return "mount/sudo not available"
+    rc = subprocess.run(
+        prefix
+        + [
+            "mount",
+            "-t",
+            "tmpfs",
+            "-o",
+            f"size={size_bytes},mode=0777",
+            "tmpfs",
+            path,
+        ],
+        capture_output=True,
+    )
+    if rc.returncode != 0:
+        return rc.stderr.decode(errors="replace").strip() or "mount failed"
+    return None
+
+
+def _try_umount(path: str) -> None:
+    prefix = _mount_cmd_prefix()
+    if prefix is None:
+        return
+    subprocess.run(prefix + ["umount", path], capture_output=True)
+
+
+class TestNixlEnospc(CustomTestCase):
+    TMPFS_BYTES = 64 * 1024
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mount_point = tempfile.mkdtemp(prefix="nixl_enospc_")
+        err = _try_mount_tmpfs(cls.mount_point, cls.TMPFS_BYTES)
+        if err is not None:
+            shutil.rmtree(cls.mount_point, ignore_errors=True)
+            raise unittest.SkipTest(f"cannot mount tmpfs: {err}")
+        cls._mounted = True
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "_mounted", False):
+            _try_umount(cls.mount_point)
+        shutil.rmtree(cls.mount_point, ignore_errors=True)
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="case_", dir=self.mount_point)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _set_one(self, hicache, key: str):
+        return hicache.batch_set_v1(
+            [key], torch.arange(_TEST_PAGE_SIZE, dtype=torch.int64)
+        )
+
+    def test_fifo_keeps_writes_within_small_tmpfs(self):
+        # Per-rank cap comfortably below tmpfs capacity -> FIFO fires first.
+        per_rank = 8 * _TEST_PAGE_BYTES
+        limit = _total_limit(per_rank)
+        hicache, _ = _make_posix_hicache_with_mock_pool(
+            self, self.test_dir, storage_limit=limit
+        )
+        try:
+            n_writes = (self.TMPFS_BYTES // _TEST_PAGE_BYTES) * 4
+            for i in range(n_writes):
+                self.assertTrue(
+                    all(self._set_one(hicache, f"k{i}")),
+                    f"set k{i} failed under FIFO with small tmpfs",
+                )
+            total = sum(
+                os.path.getsize(os.path.join(self.test_dir, f))
+                for f in os.listdir(self.test_dir)
+            )
+            self.assertLessEqual(total, per_rank)
+        finally:
+            hicache.close()
+
+    def test_reactive_fifo_recovers_from_disk_full(self):
+        # No storage_limit set; reactive FIFO step must still recover from a full FS.
+        hicache, _ = _make_posix_hicache_with_mock_pool(
+            self, self.test_dir, storage_limit=None
+        )
+        try:
+            n_writes = (self.TMPFS_BYTES // _TEST_PAGE_BYTES) * 4
+            for i in range(n_writes):
+                self.assertTrue(
+                    all(self._set_one(hicache, f"k{i}")),
+                    f"set k{i} should be recovered by reactive FIFO",
+                )
+        finally:
+            hicache.close()
+
+
+class TestParseStorageLimit(CustomTestCase):
+    def test_units_accepted(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import parse_storage_limit
+
+        self.assertEqual(parse_storage_limit("1MB"), 1024**2)
+        self.assertEqual(parse_storage_limit("2GB"), 2 * 1024**3)
+        self.assertEqual(parse_storage_limit("1TB"), 1024**4)
+        self.assertEqual(parse_storage_limit("10mb"), 10 * 1024**2)
+        self.assertEqual(parse_storage_limit("  10 mb  "), 10 * 1024**2)
+        self.assertEqual(parse_storage_limit(4096), 4096)
+        self.assertEqual(parse_storage_limit("4096"), 4096)
+
+    def test_invalid_rejected(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import parse_storage_limit
+
+        bad_values = (
+            "",
+            "1KB",
+            "1B",
+            "1XB",
+            "abc",
+            "1.5MB",
+            "1 PB",
+            True,
+            None,
+            1.5,
+            # Non-positive: would silently disable all writes downstream.
+            0,
+            -1,
+            "0",
+            "0mb",
+            "-1mb",
+        )
+        for bad in bad_values:
+            with self.assertRaises((ValueError, TypeError), msg=f"accepted {bad!r}"):
+                parse_storage_limit(bad)
+
+    def test_nested_under_plugin_honored(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlBackendConfig
+
+        nested = NixlBackendConfig(
+            {"plugin": {"posix": {"active": True, "storage_limit": "2MB"}}}
+        )
+        self.assertEqual(nested.get_storage_limit_bytes(), 2 * 1024**2)
+
+        top = NixlBackendConfig({"storage_limit": "1MB", "plugin": {"posix": {}}})
+        self.assertEqual(top.get_storage_limit_bytes(), 1024**2)
+
+        absent = NixlBackendConfig({"plugin": {"posix": {"active": True}}})
+        self.assertIsNone(absent.get_storage_limit_bytes())
+
+
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
 class TestNixlDirectIO(CustomTestCase):
     """Tests for the O_DIRECT file I/O path in NixlFileManager and HiCacheNixl."""
@@ -708,24 +1143,10 @@ class TestNixlDirectIO(CustomTestCase):
 
     def _make_direct_io_hicache(self) -> HiCacheNixl:
         """Return a HiCacheNixl configured for O_DIRECT (default) with the POSIX backend."""
-        storage_config = HiCacheStorageConfig(
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
-            attn_cp_rank=0,
-            attn_cp_size=1,
-            is_mla_model=False,
-            is_page_first_layout=False,
-            model_name="test_model",
-            enable_storage_metrics=False,
-            extra_config={"plugin": {"posix": {"active": True}}},
-            # use_direct_io defaults to True (env var)
+        # use_direct_io defaults to True (env var); omit the key.
+        return _build_hicache_or_skip(
+            self, _make_storage_config(_POSIX_DEFAULT, tp_size=1), self.test_dir
         )
-        try:
-            return HiCacheNixl(storage_config=storage_config, file_path=self.test_dir)
-        except ImportError:
-            self.skipTest("NIXL not available")
 
     def test_needs_page_alignment_true_for_file_backend(self):
         """File-based backend + use_direct_io=True must set needs_page_alignment."""
@@ -747,28 +1168,9 @@ class TestNixlDirectIO(CustomTestCase):
 
     def test_odirect_disabled_via_config(self):
         """Top-level use_direct_io=false in extra_config disables O_DIRECT."""
-        storage_config = HiCacheStorageConfig(
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
-            attn_cp_rank=0,
-            attn_cp_size=1,
-            is_mla_model=False,
-            is_page_first_layout=False,
-            model_name="test_model",
-            enable_storage_metrics=False,
-            extra_config={
-                "plugin": {"posix": {"active": True}},
-                "use_direct_io": False,
-            },
+        hicache = _build_hicache_or_skip(
+            self, _make_storage_config(_POSIX_BUFFERED, tp_size=1), self.test_dir
         )
-        try:
-            hicache = HiCacheNixl(
-                storage_config=storage_config, file_path=self.test_dir
-            )
-        except ImportError:
-            self.skipTest("NIXL not available")
         self.assertFalse(hicache.needs_page_alignment)
         self.assertFalse(hicache.file_manager.use_direct_io)
 

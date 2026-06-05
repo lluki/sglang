@@ -501,7 +501,7 @@ class HiCacheNixl(HiCacheStorage):
     ) -> None:
         total_bytes = sum(s for s in buffer_sizes if s is not None)
         bw = total_bytes / (elapsed_ms / 1000) / (1024 * 1024) if elapsed_ms else 0.0
-        logger.debug(
+        logger.info(
             f"HiCacheNixl {op_name} transferred: {num_keys} keys (pages), "
             f"{host_indices.numel()} host_indices, {total_bytes} bytes, "
             f"total time: {elapsed_ms:.3f} ms, effective bandwidth: {bw:.2f} MB/s"

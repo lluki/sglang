@@ -18,6 +18,8 @@ _SGLANG_NIXL_CONFIG_KEYS = {
     "l3_cleaner_low_watermark",
 }
 
+_OBJ_CRT_CONFIG_KEYS = ("crtMinLimit", "throughput_target_gbps")
+
 
 class NixlBackendConfig:
     """Handles NIXL backend configurations"""
@@ -183,6 +185,17 @@ class NixlBackendSelection:
                     return False
 
                 initparams["bucket"] = bucket
+
+            # NIXL's S3 CRT client consumes these OBJ plugin parameters. Keep
+            # them in the generic initparams dictionary so new plugin options remain
+            # forward-compatible, but log the known CRT tuning knobs explicitly.
+            if self.backend_name in self.OBJ_PLUGINS:
+                crt_config = {
+                    key: initparams[key]
+                    for key in _OBJ_CRT_CONFIG_KEYS
+                    if key in initparams
+                }
+                logger.info("NIXL OBJ CRT init parameters: %s", crt_config)
 
             # create backend using initialization parameters
             agent.create_backend(self.backend_name, initparams)

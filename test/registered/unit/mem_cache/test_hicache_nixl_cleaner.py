@@ -133,6 +133,24 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         default_config = NixlBackendConfig().get_l3_cleaner_config()
         self.assertTrue(default_config["enabled"])
 
+    def test_nixl_config_forwards_obj_crt_tuning(self):
+        """OBJ S3 CRT tuning parameters are passed to NIXL as strings."""
+        cfg = NixlBackendConfig(
+            {
+                "plugin": {
+                    "obj": {
+                        "active": True,
+                        "crtMinLimit": 1048576,
+                        "throughput_target_gbps": 25,
+                    }
+                }
+            }
+        )
+
+        params = cfg.get_backend_initparams("OBJ")
+        self.assertEqual(params["crtMinLimit"], "1048576")
+        self.assertEqual(params["throughput_target_gbps"], "25")
+
     def test_nixl_config_rejects_non_boolean_l3_cleaner_enabled(self):
         """Cleaner enablement uses native config booleans only."""
         cfg = NixlBackendConfig({"l3_cleaner_enabled": "false"})

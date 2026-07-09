@@ -51,16 +51,12 @@ class NixlRegistry:
         # from a single monotonic counter.
         self._obj_devid_lock = threading.Lock()
         self._obj_devid_next = 1
-        self.path_mode = mem_type == "FILE" and self._probe_path_mode()
-        if mem_type == "FILE" and self.path_mode:
+        # NIXL 1.3+ FILE backends support path mode. Do not probe by
+        # registering a nonexistent path: lazy-open backends intentionally
+        # defer that error until the first transfer.
+        self.path_mode = mem_type == "FILE"
+        if self.path_mode:
             logger.info("HiCacheNixl: path-mode FILE registration active.")
-        elif mem_type == "FILE":
-            # TODO: NIXL 1.3.0 adds path-mode support; remove this fd fallback once 1.3.0 is widely installed.
-            logger.info(
-                "HiCacheNixl: the installed NIXL build does not "
-                "support path-mode FILE registration; using legacy "
-                "fd registration."
-            )
 
     @contextmanager
     def _open_files(self, paths: List[str], create: bool):
@@ -104,31 +100,6 @@ class NixlRegistry:
                     self.agent.deregister_memory(reg)
                 except Exception as e:
                     logger.debug("deregister_memory skipped: %s", e)
-
-    def _probe_path_mode(self) -> bool:
-        """Probe whether NIXL honours path-mode metaInfo.
-
-        Register a FILE_SEG with a valid path-mode string pointing at a
-        nonexistent path (no 'create' flag). A path-mode-capable NIXL tries
-        to open() the path, fails with NIXL_ERR_BACKEND, and raises. A
-        pre-path-mode NIXL ignores metaInfo and returns NIXL_SUCCESS.
-        Error from register_memory => path mode supported.
-        """
-        reg_descs = self.agent.get_reg_descs(
-            [(0, 4096, 1, "rw:/nonexistent-nixl-probe")], "FILE"
-        )
-        if reg_descs is None:
-            return False
-        try:
-            reg = self.agent.register_memory(reg_descs)
-            if reg is not None:
-                try:
-                    self.agent.deregister_memory(reg)
-                except Exception:
-                    pass
-            return False
-        except Exception:
-            return True
 
     @contextmanager
     def storage(self, buffers, keys, direction):

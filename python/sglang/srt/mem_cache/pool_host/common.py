@@ -96,8 +96,14 @@ def alloc_with_host_register(
     CudaHostRegister only applies when pin_memory=True.
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
+    if pin_memory and torch.cuda.is_available():
         _cuda_host_register(buffer)
+    elif pin_memory:
+        logger.warning(
+            "CUDA is unavailable; allocating HiCache host memory without "
+            "cudaHostRegister. CPU-only runs can still use host memory, but "
+            "GPU transfers will not use registered host pages."
+        )
     return buffer
 
 

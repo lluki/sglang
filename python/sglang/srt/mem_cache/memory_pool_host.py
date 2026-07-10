@@ -221,6 +221,60 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def _device_pool_is_cpu(self, device_pool) -> bool:
+        if getattr(device_pool, "device", None) == "cpu":
+            return True
+        try:
+            return device_pool.k_buffer[0].device.type == "cpu"
+        except (AttributeError, IndexError, TypeError):
+            return False
+
+    def _copy_to_cpu_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id
+    ) -> None:
+        host_indices = host_indices.to(dtype=torch.long, device="cpu")
+        device_indices = device_indices.to(dtype=torch.long, device="cpu")
+        if self.layout == "layer_first":
+            device_pool.k_buffer[layer_id][device_indices].copy_(
+                self.k_buffer[layer_id][host_indices]
+            )
+            device_pool.v_buffer[layer_id][device_indices].copy_(
+                self.v_buffer[layer_id][host_indices]
+            )
+        elif self.layout == "page_first":
+            device_pool.k_buffer[layer_id][device_indices].copy_(
+                self.k_buffer[host_indices, layer_id]
+            )
+            device_pool.v_buffer[layer_id][device_indices].copy_(
+                self.v_buffer[host_indices, layer_id]
+            )
+        else:
+            raise ValueError(f"Unsupported CPU layout: {self.layout}")
+
+    def _copy_from_cpu_device_all_layer(
+        self, device_pool, host_indices, device_indices
+    ) -> None:
+        host_indices = host_indices.to(dtype=torch.long, device="cpu")
+        device_indices = device_indices.to(dtype=torch.long, device="cpu")
+        if self.layout == "layer_first":
+            for layer_id in range(self.layer_num):
+                self.k_buffer[layer_id][host_indices].copy_(
+                    device_pool.k_buffer[layer_id][device_indices]
+                )
+                self.v_buffer[layer_id][host_indices].copy_(
+                    device_pool.v_buffer[layer_id][device_indices]
+                )
+        elif self.layout == "page_first":
+            for layer_id in range(self.layer_num):
+                self.k_buffer[host_indices, layer_id].copy_(
+                    device_pool.k_buffer[layer_id][device_indices]
+                )
+                self.v_buffer[host_indices, layer_id].copy_(
+                    device_pool.v_buffer[layer_id][device_indices]
+                )
+        else:
+            raise ValueError(f"Unsupported CPU layout: {self.layout}")
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -229,6 +283,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        if io_backend == "kernel" and self._device_pool_is_cpu(device_pool):
+            self._copy_to_cpu_device_per_layer(
+                device_pool, host_indices, device_indices, layer_id
+            )
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -341,6 +400,9 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if io_backend == "kernel" and self._device_pool_is_cpu(device_pool):
+            self._copy_from_cpu_device_all_layer(device_pool, host_indices, device_indices)
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -462,7 +524,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=self.pin_memory and torch.cuda.is_available(),
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:

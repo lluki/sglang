@@ -117,6 +117,7 @@ class HiCacheL3Cleaner:
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._cleanup_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the cleaner thread on TP rank 0."""
@@ -165,7 +166,35 @@ class HiCacheL3Cleaner:
             if self._stop.wait(self.interval_sec):
                 break
 
+    def evict_oldest(self) -> bool:
+        """Evict one logical cache-key group in LRU order.
+
+        Returns whether an eviction candidate was found. Another TP process may
+        win the unlink race, but the caller should still retry its failed write.
+        """
+        with self._cleanup_lock:
+            groups = self._scan_groups()
+            if not groups:
+                return False
+            oldest = min(groups.values(), key=lambda group: group.mtime)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.unlink_workers,
+                thread_name_prefix="hicache-l3-unlink",
+            ) as pool:
+                deleted_files, bytes_deleted = self._unlink_groups([oldest], pool)
+
+        logger.info(
+            "NIXL L3 recovery eviction: deleted %d files (%.2f MiB)",
+            deleted_files,
+            bytes_deleted / (1024**2),
+        )
+        return True
+
     def _tick(self) -> bool:
+        with self._cleanup_lock:
+            return self._tick_locked()
+
+    def _tick_locked(self) -> bool:
         initial_pcts = {path: self._disk_usage_pct(path) for path in self.storage_dirs}
         hot_dirs = {
             path for path, pct in initial_pcts.items() if pct >= self.high_watermark
@@ -174,10 +203,7 @@ class HiCacheL3Cleaner:
             return False
 
         scan_start = time.perf_counter()
-        groups: dict[str, _GroupInfo] = {}
-        for base_dir in self.storage_dirs:
-            self._scan_base_dir(base_dir, groups)
-
+        groups = self._scan_groups()
         ordered = sorted(
             (group for group in groups.values() if group.base_dirs & hot_dirs),
             key=lambda group: group.mtime,
@@ -196,11 +222,9 @@ class HiCacheL3Cleaner:
             idx = 0
             while idx < len(ordered) and not self._stop.is_set():
                 batch = ordered[idx : idx + self.recheck_groups]
-                paths = list(self._iter_group_paths(batch))
-                for removed, removed_bytes in pool.map(_safe_unlink, paths):
-                    if removed:
-                        deleted_files += 1
-                        bytes_deleted += removed_bytes
+                batch_files, batch_bytes = self._unlink_groups(batch, pool)
+                deleted_files += batch_files
+                bytes_deleted += batch_bytes
                 deleted_groups += len(batch)
                 idx += len(batch)
 
@@ -221,6 +245,26 @@ class HiCacheL3Cleaner:
             {path: f"{pct:.1f}%" for path, pct in final_pcts.items()},
         )
         return True
+
+    def _scan_groups(self) -> dict[str, _GroupInfo]:
+        groups: dict[str, _GroupInfo] = {}
+        for base_dir in self.storage_dirs:
+            self._scan_base_dir(base_dir, groups)
+        return groups
+
+    def _unlink_groups(
+        self,
+        groups: Iterable[_GroupInfo],
+        pool: concurrent.futures.Executor,
+    ) -> tuple[int, int]:
+        deleted_files = 0
+        bytes_deleted = 0
+        paths = list(self._iter_group_paths(groups))
+        for removed, removed_bytes in pool.map(_safe_unlink, paths):
+            if removed:
+                deleted_files += 1
+                bytes_deleted += removed_bytes
+        return deleted_files, bytes_deleted
 
     def _scan_base_dir(self, base_dir: str, groups: dict[str, _GroupInfo]) -> None:
         if not os.path.isdir(base_dir):

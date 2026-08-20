@@ -251,16 +251,36 @@ class HiCacheNixl(HiCacheStorage):
             return False
 
         try:
-            state = self.agent.transfer(xfer_req)
-            while state != "DONE":
-                state = self.agent.check_xfer_state(xfer_req)
-                if state == "ERR":
-                    logger.error("Transfer failed")
-                    return False
-                # Best would be to have a better notification mechanism from NIXL,
-                # but we only have polling for now.
-                time.sleep(0.0001)
-            return True
+            max_attempts = (
+                5 if direction == "WRITE" and self._l3_cleaner is not None else 1
+            )
+            for attempt in range(1, max_attempts + 1):
+                state = self.agent.transfer(xfer_req)
+                while state == "PROC":
+                    state = self.agent.check_xfer_state(xfer_req)
+                    # Best would be to have a better notification mechanism from
+                    # NIXL, but we only have polling for now.
+                    if state == "PROC":
+                        time.sleep(0.0001)
+                if state == "DONE":
+                    return True
+
+                # NIXL's Python API maps NIXL_ERR_BACKEND to "ERR".
+                if (
+                    state != "ERR"
+                    or attempt == max_attempts
+                    or not self._l3_cleaner.evict_oldest()
+                ):
+                    break
+                logger.warning(
+                    "HiCacheNixl: retrying failed WRITE transfer after L3 "
+                    "eviction (attempt %d/%d)",
+                    attempt + 1,
+                    max_attempts,
+                )
+
+            logger.error("Transfer failed after %d attempt(s)", attempt)
+            return False
         except Exception as e:
             logger.error(f"Failed to execute transfer: {e}")
             import traceback

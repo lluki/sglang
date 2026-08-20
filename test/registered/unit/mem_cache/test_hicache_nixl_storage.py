@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -257,6 +258,42 @@ class MinioFixture:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
         shutil.rmtree(self.data_dir, ignore_errors=True)
+
+
+class TestNixlTransferRetry(CustomTestCase):
+    @staticmethod
+    def _make_hicache(states: list[str], *, cleaner_enabled: bool = True):
+        hicache = HiCacheNixl.__new__(HiCacheNixl)
+        hicache.agent_name = "test-agent"
+        hicache.agent = Mock()
+        hicache.agent.initialize_xfer.return_value = object()
+        hicache.agent.transfer.side_effect = states
+        hicache._l3_cleaner = Mock() if cleaner_enabled else None
+        return hicache
+
+    def test_write_retries_same_request_after_backend_error(self):
+        hicache = self._make_hicache(["PROC", "DONE"])
+        hicache.agent.check_xfer_state.return_value = "ERR"
+
+        self.assertTrue(hicache._xfer_and_wait([], [], "WRITE"))
+        self.assertEqual(hicache.agent.transfer.call_count, 2)
+        hicache._l3_cleaner.evict_oldest.assert_called_once_with()
+        hicache.agent.release_xfer_handle.assert_called_once_with(
+            hicache.agent.initialize_xfer.return_value
+        )
+
+    def test_write_stops_after_five_failed_attempts(self):
+        hicache = self._make_hicache(["ERR"] * 5)
+
+        self.assertFalse(hicache._xfer_and_wait([], [], "WRITE"))
+        self.assertEqual(hicache.agent.transfer.call_count, 5)
+        self.assertEqual(hicache._l3_cleaner.evict_oldest.call_count, 4)
+
+    def test_write_does_not_retry_when_cleaner_is_disabled(self):
+        hicache = self._make_hicache(["ERR"], cleaner_enabled=False)
+
+        self.assertFalse(hicache._xfer_and_wait([], [], "WRITE"))
+        hicache.agent.transfer.assert_called_once()
 
 
 class TestNixlUnified(CustomTestCase):

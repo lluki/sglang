@@ -93,6 +93,22 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         self.assertFalse(any(os.path.exists(path) for path in old_paths))
         self.assertTrue(all(os.path.exists(path) for path in new_paths))
 
+    def test_evict_oldest_deletes_one_group_without_watermark_check(self):
+        """Recovery eviction removes one LRU group without consulting disk usage."""
+        old_paths = [
+            self._write_key(f"page-old_model_{rank}_2", mtime=100.0)
+            for rank in range(2)
+        ]
+        new_paths = [
+            self._write_key(f"page-new_model_{rank}_2", mtime=200.0)
+            for rank in range(2)
+        ]
+        cleaner = HiCacheL3Cleaner(self.base_dirs, tp_rank=0, unlink_workers=1)
+
+        self.assertTrue(cleaner.evict_oldest())
+        self.assertFalse(any(os.path.exists(path) for path in old_paths))
+        self.assertTrue(all(os.path.exists(path) for path in new_paths))
+
     def test_tick_deletes_hybrid_components_atomically(self):
         """Evict every pool component and TP rank for one logical page."""
         physical_suffixes = [

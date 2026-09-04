@@ -704,6 +704,7 @@ class HiCacheController:
         self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
+            self.prefetch_io_aux_thread.join()
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()

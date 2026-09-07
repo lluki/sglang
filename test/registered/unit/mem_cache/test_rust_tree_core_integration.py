@@ -721,8 +721,8 @@ def test_host_lock_refs_round_trip():
     _insert(core, [1], [10])
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
     core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
-    core.inc_host_lock_ref(leaf)
-    core.dec_host_lock_ref(leaf)
+    lock_params = core.inc_host_lock_ref(leaf).to_dec_params()
+    core.dec_host_lock_ref(leaf, lock_params)
     core.sanity_check([], [])
 
 

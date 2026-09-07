@@ -146,6 +146,7 @@ class FullComponent(TreeComponent):
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
         new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
         child_cd = child.component_data[ct]
+        new_parent.component_data[ct].host_lock_ref = child_cd.host_lock_ref
         assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
         if child_cd.value is not None:
@@ -274,6 +275,11 @@ class FullComponent(TreeComponent):
             # write_back mode: the anchor may be device-only (no host_value); pin it anyway.
             if cd.host_value is None and not self.tree_core.is_write_back:
                 return result
+            if node.parent is not None:
+                # A later split inserts nodes between this anchor and its current
+                # parent. Remember that boundary so release also unlocks those
+                # fragments without touching pre-existing ancestors.
+                result.skip_lock_node_ids.setdefault(ct, set()).add(node.parent.id)
             cd.host_lock_ref += 1
             self.tree_core._update_evictable_leaf_sets(node)
             return result
@@ -312,14 +318,29 @@ class FullComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         if lock_host:
-            cd = node.component_data[ct]
-            if cd.host_lock_ref == 0:
+            assert params is not None, "host lock release requires acquisition params"
+            boundaries = params.skip_lock_node_ids.get(ct, ())
+            # A root anchor has no parent boundary, so only release the anchor.
+            if not boundaries:
+                cd = node.component_data[ct]
+                if cd.host_lock_ref == 0:
+                    return
+                if cd.host_value is None and not self.tree_core.is_write_back:
+                    return
+                cd.host_lock_ref -= 1
+                self.tree_core._update_evictable_leaf_sets(node)
                 return
-            # Mirror of `acquire`. write_back uses a pure counter.
-            if cd.host_value is None and not self.tree_core.is_write_back:
-                return
-            cd.host_lock_ref -= 1
-            self.tree_core._update_evictable_leaf_sets(node)
+            assert len(boundaries) == 1
+            while node.id not in boundaries:
+                cd = node.component_data[ct]
+                if cd.host_lock_ref == 0:
+                    return
+                # Mirror of `acquire`. write_back uses a pure counter.
+                if cd.host_value is None and not self.tree_core.is_write_back:
+                    return
+                cd.host_lock_ref -= 1
+                self.tree_core._update_evictable_leaf_sets(node)
+                node = node.parent
             return
 
         root = self.tree_core.root_node

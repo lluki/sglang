@@ -513,18 +513,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
-        binding_params = (
-            self._bindings.DecLockRefParamsBinding(
-                swa_uuid_for_lock=params.swa_uuid_for_lock,
-                swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
-                skip_lock_node_ids=_skip_lock_node_ids_to_binding(
-                    params.skip_lock_node_ids
-                ),
-            )
-            if params is not None
-            else None
+        binding_params = self._bindings.DecLockRefParamsBinding(
+            swa_uuid_for_lock=params.swa_uuid_for_lock,
+            swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
+            skip_lock_node_ids=_skip_lock_node_ids_to_binding(
+                params.skip_lock_node_ids
+            ),
         )
         self._binding.dec_host_lock_ref(node_id, binding_params)
         return DecLockRefResult()

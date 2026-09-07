@@ -7,6 +7,14 @@ fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
 }
 
+fn dec_params(lock: IncLockRefResult) -> DecLockRefParams {
+    DecLockRefParams {
+        swa_uuid_for_lock: lock.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
+        skip_lock_node_ids: lock.skip_lock_node_ids,
+    }
+}
+
 // Raw seeding for states set_value rejects: mid-split (key trimmed before the value
 // splits) and present-but-empty semantics pins.
 fn set_value_no_check<K: ChildKeyType>(
@@ -1125,7 +1133,10 @@ fn inc_host_lock_ref_pins_the_backuped_anchor() {
     tc.component_state_mut(FULL).evictable_size = 7;
     let result = tc.inc_host_lock_ref(tc.arena.node(node).id);
     assert_eq!(result.delta, None);
-    assert!(result.skip_lock_node_ids.is_empty());
+    assert_eq!(
+        result.skip_lock_node_ids[&FULL],
+        HashSet::from([tc.arena.node(tc.arena.root()).id])
+    );
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
     // The pinned anchor leaves the H-leaf set; the device tier is untouched.
     assert!(!tc.evictable_host_leaves.contains(node));
@@ -1192,8 +1203,21 @@ fn host_lock_round_trips_on_a_root_anchor_are_noops() {
     let result = tc.inc_host_lock_ref(tc.arena.node(root).id);
     assert_eq!(result.delta, None);
     assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
-    tc.dec_host_lock_ref(tc.arena.node(root).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(root).id, &dec_params(result));
     assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
+}
+
+#[test]
+fn write_back_root_host_lock_round_trips_without_a_parent_boundary() {
+    let mut tc = write_back_core();
+    let root = tc.arena.root();
+    let baseline = tc.arena.host_lock_ref(root, FULL);
+    let root_handle = tc.arena.node(root).id;
+    let lock = tc.inc_host_lock_ref(root_handle);
+    let params = dec_params(lock);
+    assert_eq!(tc.arena.host_lock_ref(root, FULL), baseline + 1);
+    tc.dec_host_lock_ref(root_handle, &params);
+    assert_eq!(tc.arena.host_lock_ref(root, FULL), baseline);
 }
 
 #[test]
@@ -1213,8 +1237,8 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
     tc.component_state_mut(FULL).evictable_size = 7;
-    tc.inc_host_lock_ref(tc.arena.node(node).id);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    let params = dec_params(tc.inc_host_lock_ref(tc.arena.node(node).id));
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &params);
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
     let state = tc.component_state(FULL);
@@ -1226,7 +1250,7 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
 fn dec_host_lock_ref_on_an_unlocked_anchor_is_a_noop() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
 }
 
@@ -1235,9 +1259,9 @@ fn dec_host_lock_ref_keeps_the_counter_when_the_host_value_is_gone() {
     // A host-evicted anchor keeps its pin count under write-through.
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(node).id);
+    let params = dec_params(tc.inc_host_lock_ref(tc.arena.node(node).id));
     let _ = tc.arena.take_host_value(node, FULL);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &params);
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
 }
 
@@ -1245,8 +1269,8 @@ fn dec_host_lock_ref_keeps_the_counter_when_the_host_value_is_gone() {
 fn host_lock_round_trip_under_write_back_is_a_pure_counter() {
     let mut tc = write_back_core();
     let (_n1, n2) = lock_chain(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(n2).id);
-    tc.dec_host_lock_ref(tc.arena.node(n2).id, /* params = */ None);
+    let params = dec_params(tc.inc_host_lock_ref(tc.arena.node(n2).id));
+    tc.dec_host_lock_ref(tc.arena.node(n2).id, &params);
     assert_eq!(tc.arena.host_lock_ref(n2, FULL), 0);
     let state = tc.component_state(FULL);
     assert_eq!(state.evictable_size, 5);
@@ -1270,23 +1294,32 @@ fn acquire_host_arm_updates_the_h_leaf_set_without_the_dispatcher() {
 fn release_host_arm_updates_the_h_leaf_set_without_the_dispatcher() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
+    let params = dec_params(tc.inc_host_lock_ref(tc.arena.node(node).id));
+    FullComponent.release_component_lock(&mut tc, node, Some(&params), /* lock_host = */ true);
+    assert!(tc.evictable_host_leaves.contains(node));
+}
+
+#[test]
+#[should_panic(expected = "host lock release requires acquisition params")]
+fn release_host_arm_rejects_missing_acquisition_params() {
+    let mut tc = core();
+    let node = host_lock_anchor(&mut tc);
     tc.inc_host_lock_ref(tc.arena.node(node).id);
     FullComponent.release_component_lock(
         &mut tc, node, /* params = */ None, /* lock_host = */ true,
     );
-    assert!(tc.evictable_host_leaves.contains(node));
 }
 
 #[test]
 fn nested_host_locks_release_pairwise() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.inc_host_lock_ref(tc.arena.node(node).id);
-    tc.inc_host_lock_ref(tc.arena.node(node).id);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    let first_params = dec_params(tc.inc_host_lock_ref(tc.arena.node(node).id));
+    let second_params = dec_params(tc.inc_host_lock_ref(tc.arena.node(node).id));
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &second_params);
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
     assert!(!tc.evictable_host_leaves.contains(node));
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &first_params);
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
 }
@@ -2111,14 +2144,44 @@ fn redistribute_preserves_preexisting_parent_slot_value() {
 }
 
 #[test]
-fn redistribute_does_not_copy_host_lock_ref() {
+fn redistribute_copies_host_lock_ref() {
     let mut tc = core();
     let (parent, child) = nodes(&mut tc);
     tc.arena
         .node_mut(child)
         .set_lock_ref_(ValueSlotIdx::host(FULL), 5);
     FullComponent.redistribute_on_node_split(&mut tc, parent, child);
-    assert_eq!(tc.arena.host_lock_ref(parent, FULL), 0);
+    assert_eq!(tc.arena.host_lock_ref(parent, FULL), 5);
+}
+
+#[test]
+fn host_lock_survives_split_and_releases_all_fragments() {
+    let mut tc = core();
+    let root = tc.arena.root();
+    let child = tc
+        .arena
+        .alloc_child(
+            root,
+            /* key = */ vec![1, 2, 3, 4],
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap();
+    tc.arena
+        .set_host_value(child, FULL, Tensor::from_slice(&[10i64, 11, 12, 13]));
+
+    let child_handle = tc.arena.node(child).id;
+    let lock = tc.inc_host_lock_ref(child_handle);
+    let params = dec_params(lock);
+
+    let (prefix, action) = tc.split_node_(child, 2);
+    assert!(action.is_none());
+    assert_eq!(tc.arena.host_lock_ref(prefix, FULL), 1);
+    assert_eq!(tc.arena.host_lock_ref(child, FULL), 1);
+
+    tc.dec_host_lock_ref(child_handle, &params);
+    assert_eq!(tc.arena.host_lock_ref(prefix, FULL), 0);
+    assert_eq!(tc.arena.host_lock_ref(child, FULL), 0);
 }
 
 #[test]

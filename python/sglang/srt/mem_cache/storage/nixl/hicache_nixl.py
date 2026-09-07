@@ -37,6 +37,19 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 
+def _maybe_delay_set_for_debug() -> None:
+    """Opt-in pause used to expose host-buffer ownership races in tests."""
+    raw = os.environ.get("SGLANG_HICACHE_NIXL_SET_DELAY_S", "0")
+    try:
+        delay_s = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid SGLANG_HICACHE_NIXL_SET_DELAY_S=%r", raw)
+        return
+    if delay_s > 0:
+        logger.warning("Delaying NIXL set path by %.3f seconds", delay_s)
+        time.sleep(delay_s)
+
+
 def _parse_storage_dirs(raw: Optional[str]) -> List[str]:
     """Split NIXL FILE storage directory config into ordered unique paths."""
     if not raw:
@@ -863,6 +876,7 @@ class HiCacheNixl(HiCacheStorage):
             )
             return [False] * len(keys)
 
+        _maybe_delay_set_for_debug()
         key_strs, host_buffers = self._batch_preprocess(keys, host_indices, "set")
         if not key_strs or not host_buffers:
             return [False] * len(keys)
@@ -986,6 +1000,7 @@ class HiCacheNixl(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
+        _maybe_delay_set_for_debug()
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
             _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(

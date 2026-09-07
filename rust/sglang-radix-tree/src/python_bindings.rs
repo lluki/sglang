@@ -1716,10 +1716,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        params: Option<&DecLockRefParamsBinding>,
+        params: &DecLockRefParamsBinding,
     ) -> PyResult<()> {
-        let params = params.map(|p| p.to_dec_lock_ref_params()).transpose()?;
-        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, params.as_ref()));
+        let params = params.to_dec_lock_ref_params()?;
+        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, &params));
         Ok(())
     }
 
@@ -2744,12 +2744,11 @@ macro_rules! tree_core_binding {
             }
 
             /// Decrease the reference count on a node's host-side component locks.
-            #[pyo3(signature = (node_id, params = None))]
             fn dec_host_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                params: Option<&DecLockRefParamsBinding>,
+                params: &DecLockRefParamsBinding,
             ) -> PyResult<()> {
                 self.inner.dec_host_lock_ref(py, node_id, params)
             }

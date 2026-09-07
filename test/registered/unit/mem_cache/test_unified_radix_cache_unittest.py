@@ -4838,6 +4838,40 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(m.host_hit_length, 0)
         cache.sanity_check()
 
+    def test_hicache_split_preserves_inflight_full_host_pin(self):
+        """A split prefix keeps an outstanding storage backup's host ownership."""
+        if self.cfg != CacheConfig():
+            self.skipTest("single Full page-size-1 ownership regression")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        seq = [1, 2, 3, 4]
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(cache, leaf)
+
+        lock_params = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 9, 10])
+        split_parent = _node_parent(cache, leaf)
+        split_host = _host_value(cache, split_parent, ComponentType.FULL)
+
+        # Before the fix the prefix had host_lock_ref == 0 and these slots were
+        # reclaimed while the storage thread could still be reading them.
+        self.assertEqual(cache.evict_host(len(split_host)), 0)
+
+        # Dropping the acquisition params used to unlock only the original
+        # child, permanently leaking the copied lock on the split prefix.
+        with self.assertRaises(TypeError):
+            cache.dec_host_lock_ref(leaf)
+        self.assertEqual(cache.evict_host(len(split_host)), 0)
+
+        cache.dec_host_lock_ref(leaf, lock_params)
+        self.assertEqual(cache.evict_host(len(split_host)), len(split_host))
+        cache.sanity_check()
+
     def _skip_unsupported_hicache_test(self):
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")

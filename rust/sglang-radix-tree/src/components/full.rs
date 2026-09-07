@@ -85,6 +85,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         let (new_parent, child) = tree_core.arena.node_pair_mut(new_parent_id, child_id);
         let split_len = new_parent.key.atom_len() as i64;
         new_parent.copy_device_lock_ref(FULL, child);
+        new_parent.set_lock_ref_(FullComponent::HOST, child.host_lock_ref(FULL));
         if child.has_device_value(FULL) {
             Node::redistribute_child_device_value(new_parent, child, FULL, split_len);
         }
@@ -280,12 +281,19 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
         // Only the last host node needs to be protected.
         if lock_host {
-            let node = tree_core.arena.node_mut(node_id);
             // write_back mode: the anchor may be device-only (no host_value); pin it anyway.
-            if !node.has_host_value(FULL) && !tree_core.is_write_back {
+            if !tree_core.arena.node(node_id).has_host_value(FULL) && !tree_core.is_write_back {
                 return result;
             }
-            node.inc_host_lock_ref(FULL);
+            if let Some(parent) = tree_core.arena.node(node_id).try_parent() {
+                let boundary = tree_core.arena.node(parent).id;
+                result
+                    .skip_lock_node_ids
+                    .entry(ct)
+                    .or_default()
+                    .insert(boundary);
+            }
+            tree_core.arena.node_mut(node_id).inc_host_lock_ref(FULL);
             tree_core.update_evictable_leaf_sets_(node_id);
             return result;
         }
@@ -346,16 +354,39 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         let ct = FULL;
 
         if lock_host {
-            let node = tree_core.arena.node_mut(node_id);
-            if node.host_lock_ref(FULL) == 0 {
+            let params = params.expect("host lock release requires acquisition params");
+            let Some(boundaries) = params
+                .skip_lock_node_ids
+                .get(&ct)
+                .filter(|ids| !ids.is_empty())
+            else {
+                let node = tree_core.arena.node_mut(node_id);
+                if node.host_lock_ref(FULL) == 0
+                    || (!node.has_host_value(FULL) && !tree_core.is_write_back)
+                {
+                    return;
+                }
+                node.dec_host_lock_ref(FULL);
+                tree_core.update_evictable_leaf_sets_(node_id);
                 return;
+            };
+            assert_eq!(boundaries.len(), 1);
+            let mut cur = node_id;
+            loop {
+                let node = tree_core.arena.node(cur);
+                if boundaries.contains(&node.id) {
+                    break;
+                }
+                if node.host_lock_ref(FULL) == 0
+                    || (!node.has_host_value(FULL) && !tree_core.is_write_back)
+                {
+                    return;
+                }
+                let parent = node.parent();
+                tree_core.arena.node_mut(cur).dec_host_lock_ref(FULL);
+                tree_core.update_evictable_leaf_sets_(cur);
+                cur = parent;
             }
-            // Mirror of `acquire`. write_back uses a pure counter.
-            if !node.has_host_value(FULL) && !tree_core.is_write_back {
-                return;
-            }
-            node.dec_host_lock_ref(FULL);
-            tree_core.update_evictable_leaf_sets_(node_id);
             return;
         }
 

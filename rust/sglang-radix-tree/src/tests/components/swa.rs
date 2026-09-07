@@ -1647,7 +1647,7 @@ fn inc_host_lock_ref_runs_full_and_swa_host_arms_together() {
         skip_lock_node_ids: result.skip_lock_node_ids,
         ..Default::default()
     };
-    tc.dec_host_lock_ref(tc.arena.node(c).id, Some(&params));
+    tc.dec_host_lock_ref(tc.arena.node(c).id, &params);
     assert_eq!(tc.arena.host_lock_ref(c, FULL), 0);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
@@ -1676,7 +1676,7 @@ fn dec_host_lock_ref_with_the_inner_uuid_leaves_an_outer_window_pinned() {
         skip_lock_node_ids: inner.skip_lock_node_ids,
         ..Default::default()
     };
-    tc.dec_host_lock_ref(tc.arena.node(c).id, Some(&params));
+    tc.dec_host_lock_ref(tc.arena.node(c).id, &params);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);

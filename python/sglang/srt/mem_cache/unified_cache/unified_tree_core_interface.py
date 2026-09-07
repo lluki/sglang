@@ -313,9 +313,9 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
-        """Decrease the reference count on a node's host-side component locks."""
+        """Release host locks using the parameters returned by acquisition."""
         ...
 
     @abstractmethod

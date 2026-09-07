@@ -40,8 +40,9 @@ pub struct IncLockRefResult {
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid minted/reused by the host lock walk.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Per-component nodes that were tombstones at acquire time; replayed at
-    /// release so the unlock skips them.
+    /// Per-component node markers needed to replay a release. Most are
+    /// tombstones skipped at acquire; Full host locks store their parent
+    /// boundary so split fragments can be unlocked too.
     pub skip_lock_node_ids: HashMap<ComponentType, HashSet<NodeId>>,
 }
 
@@ -52,7 +53,7 @@ pub struct DecLockRefParams {
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid the host unlock stops at, from the matching acquire.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Per-component nodes the unlock walk skips (from the matching acquire).
+    /// Per-component replay markers from the matching acquire.
     pub skip_lock_node_ids: HashMap<ComponentType, HashSet<NodeId>>,
 }
 
@@ -931,12 +932,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn dec_host_lock_ref(
         &mut self,
         node_id: NodeId,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
     ) -> DecLockRefResult {
         let node_id = self.arena.resolve(node_id);
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
-            component.release_component_lock(self, node_id, params, /* lock_host = */ true);
+            component.release_component_lock(
+                self,
+                node_id,
+                Some(params),
+                /* lock_host = */ true,
+            );
         }
         self.update_evictable_leaf_sets_(node_id);
         DecLockRefResult::default()

@@ -692,7 +692,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
         for component in self.components:

@@ -843,7 +843,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.inc_host_lock_ref(node_id)
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()

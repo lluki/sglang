@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 _SUCCESS = {"OK", "SUCCESS", "SUCCEEDED", "DONE", "HIT", "FOUND", "TRUE"}
 _ALREADY_PRESENT = {"ALREADY_PRESENT", "EXISTS", "EXISTING"}
 _MISS = {"MISS", "NOT_FOUND", "NOTFOUND", "ABSENT", "FALSE"}
+_MAX_IO_FAILURE_WARNINGS = 3
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,7 @@ class HiCacheNixlShard(HiCacheStorage):
             "set_pages": 0,
             "set_successes": 0,
         }
+        self._io_failure_warnings = 0
         self._client = injected.get("client")
         if self._client is None:
             self._client = self._create_client(config, injected)
@@ -413,6 +415,50 @@ class HiCacheNixlShard(HiCacheStorage):
                 ok = self._copy_value(items[i], buffers[i])
             answer.append(ok)
         successes = sum(answer)
+        if operation in ("set", "get"):
+            unexpected_failures = [
+                i
+                for i, ok in enumerate(answer)
+                if not ok
+                and (
+                    operation == "set"
+                    or i >= len(items)
+                    or _status_name(items[i]) not in _MISS
+                )
+            ]
+            if (
+                unexpected_failures
+                and self._io_failure_warnings < _MAX_IO_FAILURE_WARNINGS
+            ):
+                first = unexpected_failures[0]
+                status = (
+                    _status_name(items[first])[:32]
+                    if first < len(items)
+                    else "MISSING_RESULT"
+                )
+                detail = (
+                    str(_field(items[first], "detail", ""))
+                    if first < len(items)
+                    else ""
+                )
+                for key in keys:
+                    detail = detail.replace(key, "<key>")
+                detail = " ".join(detail.split())[:160]
+                self._io_failure_warnings += 1
+                logger.warning(
+                    "NIXLShard batch_%s failures=%d/%d first_status=%s "
+                    "first_detail=%s%s",
+                    operation,
+                    len(unexpected_failures),
+                    len(keys),
+                    status,
+                    detail,
+                    (
+                        " (further failure warnings suppressed)"
+                        if self._io_failure_warnings == _MAX_IO_FAILURE_WARNINGS
+                        else ""
+                    ),
+                )
         self._metrics[f"{operation}_pages"] += len(keys)
         result_metric = "set_successes" if operation == "set" else f"{operation}_hits"
         self._metrics[result_metric] += successes

@@ -1,8 +1,10 @@
 """Focused tests for the NIXLShard dynamic HiCache adapter."""
 
 import ctypes
+import logging
 from dataclasses import dataclass
 from enum import Enum
+from types import SimpleNamespace
 
 import torch
 
@@ -243,6 +245,50 @@ def test_miss_fails_only_its_logical_page():
 
     result = backend.batch_get_v2([transfer(PoolName.KV, ["p0", "p1"])])
     assert result[PoolName.KV] == [False, True]
+
+
+def test_failed_io_warning_is_bounded_and_redacts_keys(caplog):
+    class FailingClient:
+        def batch_set(self, keys, sources):
+            return [
+                SimpleNamespace(
+                    status=Status.ERROR,
+                    detail=f"request exceeds limit for {keys[0]} " + "x" * 300,
+                )
+            ]
+
+        def batch_get(self, keys, destinations):
+            return [SimpleNamespace(status=Status.MISS, detail="cache miss")]
+
+    backend = make_backend(FailingClient())
+    key = "private-full-page-key"
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            assert backend._call_client("set", [key], [[(1, 8)]]) == [False]
+        assert backend._call_client("get", [key], [[(1, 8)]]) == [False]
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "batch_set failures" in record.message
+    ]
+    assert len(warnings) == 3
+    assert all("first_status=ERROR" in message for message in warnings)
+    assert all("request exceeds limit" in message for message in warnings)
+    assert all(key not in message and len(message) < 300 for message in warnings)
+    assert "further failure warnings suppressed" in warnings[-1]
+    assert not any("batch_get failures" in record.message for record in caplog.records)
+
+    class FailingGetClient(FailingClient):
+        def batch_get(self, keys, destinations):
+            return [SimpleNamespace(status=Status.ERROR, detail="remote read failed")]
+
+    caplog.clear()
+    read_backend = make_backend(FailingGetClient())
+    with caplog.at_level(logging.WARNING):
+        assert read_backend._call_client("get", [key], [[(1, 8)]]) == [False]
+    assert len(caplog.records) == 1
+    assert "batch_get failures=1/1 first_status=ERROR" in caplog.records[0].message
+    assert "remote read failed" in caplog.records[0].message
 
 
 def test_exists_uses_one_batch_and_honors_pool_hit_policies():

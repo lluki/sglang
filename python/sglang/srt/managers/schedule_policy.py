@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.l3_timing import trace_l3
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
@@ -1207,12 +1208,19 @@ class PrefillAdder:
 
             if req.needs_host_load_back():
                 promised_host_hit = req.host_hit_length
+                trace_l3("load_back_begin", req.rid, host_hit_tokens=promised_host_hit)
                 loaded = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
+                )
+                trace_l3(
+                    "load_back_queued",
+                    req.rid,
+                    loaded_tokens=len(loaded[0]) if loaded else 0,
+                    node_id=loaded[1] if loaded else None,
                 )
                 if loaded is None:
                     return AddReqResult.OTHER

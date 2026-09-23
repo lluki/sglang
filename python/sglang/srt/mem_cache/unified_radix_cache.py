@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 )
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
+from sglang.srt.mem_cache.l3_timing import trace_l3
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PrefetchOperation,
@@ -2035,6 +2036,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
             assume_stored=assume_stored,
         )
+        trace_l3("prefetch_queued", request.rid, pages=len(prefetch_key) // self.page_size)
         stats["issued"] += 1
         if assume_stored:
             stats["issued_assumed_stored"] += 1
@@ -2127,6 +2129,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # into the radix tree or released to pool.
 
         request = operation.handle
+        trace_l3("prefetch_commit_begin", request.rid)
         completed_tokens = operation.completed_tokens
         hash_value = operation.hash_value
 
@@ -2237,6 +2240,7 @@ class UnifiedRadixCache(BasePrefixCache):
             loaded_from_storage,
             self.cache_controller.prefetch_tokens_occupied,
         )
+        trace_l3("prefetch_commit_end", request.rid, loaded_tokens=loaded_from_storage)
         return
 
     def _check_hybrid_prefetch_result(
@@ -3212,6 +3216,17 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            trace_l3(
+                "h2d_ack",
+                "",
+                node_ids=ack.node_ids,
+                bytes=ack.num_bytes,
+                gpu_ms=(
+                    ack.start_event.elapsed_time(ack.finish_event)
+                    if ack.timing_enabled
+                    else None
+                ),
+            )
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None

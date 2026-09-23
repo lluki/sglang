@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.l3_timing import trace_l3
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
@@ -945,6 +946,7 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        trace_l3("h2d_start", "", node_ids=op.node_ids)
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]

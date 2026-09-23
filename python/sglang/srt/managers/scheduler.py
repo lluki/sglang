@@ -286,6 +286,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.l3_timing import trace_l3
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -2773,6 +2774,7 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        trace_l3("scheduler_received", recv_req.rid)
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -4318,6 +4320,8 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        for req in batch.reqs:
+            trace_l3("forward_begin", req.rid, mode=str(batch.forward_mode))
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -4734,6 +4738,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        for req in batch.reqs:
+            trace_l3("forward_result", req.rid, mode=str(batch.forward_mode))
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4774,6 +4780,8 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        for req in batch.reqs:
+            trace_l3("result_processed", req.rid, mode=str(batch.forward_mode))
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

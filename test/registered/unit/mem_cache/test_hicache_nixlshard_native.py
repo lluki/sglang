@@ -13,9 +13,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+from test_hicache_nixlshard import Pool, config
 
 from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
-from test_hicache_nixlshard import Pool, config
 
 
 @unittest.skipUnless(
@@ -58,7 +58,9 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
             for direct_io in (False, True):
                 with self.subTest(
                     layout=layout, direct_io=direct_io
-                ), tempfile.TemporaryDirectory() as directory:
+                ), tempfile.TemporaryDirectory(
+                    dir=os.environ.get("NIXLSHARD_TEST_DIR", "/raid/nixlshard-v2")
+                ) as directory:
                     pool = Pool(layout)
                     backend = self.backend(pool, directory, direct_io)
                     expected = pool.kv_buffer.clone()
@@ -76,7 +78,9 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                     backend.close()
 
     def test_concurrent_backup_prefetch_and_absent_page(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(
+            dir=os.environ.get("NIXLSHARD_TEST_DIR", "/raid/nixlshard-v2")
+        ) as directory:
             pool = Pool("layer_first")
             backend = self.backend(pool, directory, direct_io=True)
             expected = pool.kv_buffer[:, :, :2].clone()

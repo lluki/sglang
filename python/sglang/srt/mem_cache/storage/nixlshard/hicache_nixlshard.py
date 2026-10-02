@@ -11,8 +11,9 @@ import json
 import logging
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager
+from functools import lru_cache
 
 import torch
 
@@ -24,6 +25,22 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _metrics_snapshot_class():
+    # Metrics imports pull in model/quantization dependencies. Keep them optional
+    # for standalone CPU/native benchmarks with framework metrics disabled.
+    from sglang.srt.observability.metrics_collector import StorageMetrics
+
+    class NixlShardStats(dict, StorageMetrics):
+        """Framework histogram samples plus cumulative JSON counters."""
+
+        def __init__(self, counters, samples):
+            dict.__init__(self, counters)
+            StorageMetrics.__init__(self, **samples)
+
+    return NixlShardStats
 
 
 class HiCacheNixlShard(HiCacheStorage):
@@ -55,6 +72,15 @@ class HiCacheNixlShard(HiCacheStorage):
         self._registrations = []
         self._host_buffer = None
         self._stats = Counter()
+        self._metric_samples = {
+            name: deque(maxlen=1024)
+            for name in (
+                "prefetch_pgs",
+                "backup_pgs",
+                "prefetch_bandwidth",
+                "backup_bandwidth",
+            )
+        }
         self.mem_pool_host = None
 
     def register_mem_pool_host(self, pool):
@@ -237,6 +263,7 @@ class HiCacheNixlShard(HiCacheStorage):
                 raise ValueError("empty key batch has nonempty host indices")
             return []
         with self._operation():
+            start = time.perf_counter()
             namespaced = self._keys(keys)
             pages = self._page_segments(keys, host_indices)
             hints = self._hints(extra_info, len(keys))
@@ -264,6 +291,16 @@ class HiCacheNixlShard(HiCacheStorage):
                 self._stats[f"{direction}_pages"] += len(results)
                 self._stats[f"{direction}_hits"] += sum(results)
                 self._stats[f"{direction}_bytes"] += self._page_bytes * sum(results)
+                if self.storage_config.enable_storage_metrics:
+                    prefix = "prefetch" if direction == "get" else "backup"
+                    self._metric_samples[f"{prefix}_pgs"].append(sum(results))
+                    bandwidth = (
+                        self._page_bytes
+                        * sum(results)
+                        / max(time.perf_counter() - start, 1e-9)
+                        / (1024**3)
+                    )
+                    self._metric_samples[f"{prefix}_bandwidth"].append(bandwidth)
             return results
 
     def batch_get_v1(self, keys, host_indices, extra_info=None):
@@ -333,13 +370,20 @@ class HiCacheNixlShard(HiCacheStorage):
     def get_stats(self):
         with self._condition:
             stats = dict(self._stats)
+            samples = {
+                name: list(values) for name, values in self._metric_samples.items()
+            }
+            for values in self._metric_samples.values():
+                values.clear()
         # Prefix native counters to preserve the adapter's page-level counts.
         # Native counters include private staging, POSIX, and peer-control costs.
         if hasattr(self.agent, "stats"):
             stats.update(
                 {f"native_{key}": value for key, value in self.agent.stats().items()}
             )
-        return stats
+        if not self.storage_config.enable_storage_metrics:
+            return stats
+        return _metrics_snapshot_class()(stats, samples)
 
     def close(self):
         with self._condition:

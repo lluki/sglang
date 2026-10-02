@@ -4,6 +4,7 @@
 
 import ctypes
 import gc
+import sys
 import threading
 import types
 import unittest
@@ -147,16 +148,19 @@ def config(revision="abc123", direct_io=False, tp_rank=0):
 
 class TestHiCacheNixlShard(unittest.TestCase):
     def setUp(self):
-        self.module_patch = patch.dict(
-            "sys.modules", {"nixlshard": types.SimpleNamespace(Agent=FakeAgent)}
-        )
-        self.module_patch.start()
+        # Restore only the mocked module; clearing all modules would reload
+        # native MLIR/CUTLASS extension types imported by framework metrics.
+        self.original_native_module = sys.modules.get("nixlshard")
+        sys.modules["nixlshard"] = types.SimpleNamespace(Agent=FakeAgent)
         self.backends = []
 
     def tearDown(self):
         for backend in self.backends:
             backend.close()
-        self.module_patch.stop()
+        if self.original_native_module is None:
+            sys.modules.pop("nixlshard", None)
+        else:
+            sys.modules["nixlshard"] = self.original_native_module
 
     def backend(self, pool=None, **kwargs):
         pool = pool or Pool()
@@ -305,6 +309,35 @@ class TestHiCacheNixlShard(unittest.TestCase):
         self.assertEqual(stats["set_hits"], 1)
         self.assertEqual(stats["native_set_hits"], 99)
         self.assertEqual(stats["native_staged_bytes"], 256)
+
+    def test_framework_metrics_accept_counter_snapshot_and_drain_samples_once(self):
+        from sglang.srt.observability.metrics_collector import (
+            StorageMetrics,
+            StorageMetricsCollector,
+        )
+
+        backend = self.backend()
+        backend.batch_set_v1(["a"], torch.arange(2))
+        backend.batch_get_v1(["a"], torch.arange(2))
+        snapshot = backend.get_stats()
+        self.assertIsInstance(snapshot, StorageMetrics)
+        self.assertEqual(snapshot.backup_pgs, [1])
+        self.assertEqual(snapshot.prefetch_pgs, [1])
+        collector = object.__new__(StorageMetricsCollector)
+        collector._log_histogram = Mock()
+        for name in (
+            "histogram_prefetch_pgs",
+            "histogram_backup_pgs",
+            "histogram_prefetch_bandwidth",
+            "histogram_backup_bandwidth",
+        ):
+            setattr(collector, name, Mock())
+        collector.log_storage_metrics(snapshot)
+        self.assertEqual(collector._log_histogram.call_count, 4)
+        drained = backend.get_stats()
+        self.assertEqual(drained.backup_pgs, [])
+        self.assertEqual(drained.prefetch_pgs, [])
+        self.assertEqual(drained["get_hits"], 1)
 
     def test_controller_selects_registered_page_interface_and_prefix_policy(self):
         from sglang.srt.managers.cache_controller import HiCacheController

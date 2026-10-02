@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to SGLang project
+"""Opt-in adapter tests against the built NIXLShard POSIX/UCX runtime.
+
+Set SGLANG_RUN_NIXLSHARD_NATIVE=1 and add the rebuilt nixlshard package to
+PYTHONPATH. These tests create disposable files, never block devices.
+"""
+
+import os
+import tempfile
+import unittest
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+import torch
+
+from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
+from test_hicache_nixlshard import Pool, config
+
+
+@unittest.skipUnless(
+    os.environ.get("SGLANG_RUN_NIXLSHARD_NATIVE") == "1",
+    "requires the rebuilt native NIXLShard runtime",
+)
+class TestNativeHiCacheNixlShard(unittest.TestCase):
+    def backend(self, pool, directory, direct_io):
+        storage_config = config(direct_io=direct_io)
+        storage_config.extra_config["agent"] = {
+            "name": "hicache-test-" + uuid.uuid4().hex,
+            "disks": [
+                {
+                    "path": os.path.join(directory, "cache.bin"),
+                    "capacity_bytes": 16 * 1024 * 1024,
+                    "unit_bytes": 4096,
+                    "metadata_bytes": 1024 * 1024,
+                    "create": True,
+                }
+            ],
+            "listen_host": "127.0.0.1",
+            "listen_port": 0,
+            "max_inflight": 32,
+            "timeout_ms": 5000,
+            "staging_slot_bytes": 4096,
+            "staging_slots": 4,
+            "workers": 2,
+            "direct_io": direct_io,
+        }
+        backend = StorageBackendFactory.create_backend(
+            "nixlshard", storage_config, pool
+        )
+        self.addCleanup(backend.close)
+        backend.register_mem_pool_host(pool)
+        self.assertNotEqual(backend.build_marker, "unknown")
+        return backend
+
+    def test_local_segmented_roundtrip_unaligned_pages(self):
+        for layout in ("page_first", "page_first_direct", "page_head", "layer_first"):
+            for direct_io in (False, True):
+                with self.subTest(
+                    layout=layout, direct_io=direct_io
+                ), tempfile.TemporaryDirectory() as directory:
+                    pool = Pool(layout)
+                    backend = self.backend(pool, directory, direct_io)
+                    expected = pool.kv_buffer.clone()
+                    keys = ["page-a", "page-b", "page-c", "page-d"]
+                    self.assertEqual(
+                        backend.batch_set_v1(keys, torch.arange(8)), [True] * 4
+                    )
+                    self.assertEqual(backend.batch_exists(keys), 4)
+                    pool.kv_buffer.zero_()
+                    self.assertEqual(
+                        backend.batch_get_v1(keys, torch.arange(8)), [True] * 4
+                    )
+                    torch.testing.assert_close(pool.kv_buffer, expected)
+                    self.assertEqual(backend.get_stats()["get_hits"], 4)
+                    backend.close()
+
+    def test_concurrent_backup_prefetch_and_absent_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = Pool("layer_first")
+            backend = self.backend(pool, directory, direct_io=True)
+            expected = pool.kv_buffer[:, :, :2].clone()
+            self.assertEqual(backend.batch_set_v1(["old"], torch.arange(2)), [True])
+            with ThreadPoolExecutor(2) as workers:
+                read = workers.submit(backend.batch_get_v1, ["old"], torch.arange(2, 4))
+                write = workers.submit(
+                    backend.batch_set_v1, ["new"], torch.arange(4, 6)
+                )
+                self.assertEqual(read.result(timeout=10), [True])
+                self.assertEqual(write.result(timeout=10), [True])
+            torch.testing.assert_close(pool.kv_buffer[:, :, 2:4], expected)
+            self.assertEqual(backend.batch_exists(["old", "absent", "new"]), 1)
+            self.assertEqual(
+                backend.batch_get_v1(["absent"], torch.arange(6, 8)), [False]
+            )
+            backend.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -600,6 +600,7 @@ class HiCacheController:
                     "npu_memcache",
                     "eic",
                     "nixl",
+                    "nixlshard",
                     "simm",
                     "mori",
                 ]

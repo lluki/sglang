@@ -132,6 +132,13 @@ config = SimpleNamespace(model_name="test-model", tp_rank=0, tp_size=2, dp_rank=
 exporter = NativeMetricsExporter(config)
 exporter.observe({"posix_write_ns": 2000000000, "posix_write_bytes": 8192, "timeout": 1})
 exporter.observe({"posix_write_ns": 2000000000, "posix_write_bytes": 8192, "timeout": 1})
+batch_events = {"remote_load_batch_requests": 3, "remote_served_batch_requests": 4,
+                "remote_group_fallbacks": 1}
+exporter.observe(batch_events)
+exporter.observe(batch_events)  # repeated observations must not count RPCs twice
+exporter.observe({})  # an older native snapshot with absent fields does not reset
+exporter.observe({"remote_load_batch_requests": 5, "remote_served_batch_requests": 6,
+                  "remote_group_fallbacks": 2})
 """
         with tempfile.TemporaryDirectory() as directory:
             environment = dict(os.environ, PROMETHEUS_MULTIPROC_DIR=directory)
@@ -167,6 +174,16 @@ exporter.observe({"posix_write_ns": 2000000000, "posix_write_bytes": 8192, "time
             self.assertEqual(
                 value(registry, "sglang:nixlshard_events_total", "event", "timeout"), 1
             )
+            for event, expected in (
+                ("remote_load_batch_requests", 5),
+                ("remote_served_batch_requests", 6),
+                ("remote_group_fallbacks", 2),
+            ):
+                with self.subTest(event=event):
+                    self.assertEqual(
+                        value(registry, "sglang:nixlshard_events_total", "event", event),
+                        expected,
+                    )
 
 
 if __name__ == "__main__":

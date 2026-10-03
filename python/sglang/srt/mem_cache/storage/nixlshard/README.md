@@ -131,6 +131,19 @@ directions. Checkpoint timing covers periodic/explicit checkpoints; eager
 reclamation is not timed separately. Event statuses describe batch workers,
 rather than every incoming RPC. Failed exists RPCs contribute to their timer.
 
+For native builds supporting `remote_batch_limit`, three event labels describe
+grouped remote loads. `remote_load_batch_requests` counts requester group RPCs
+that return a parsed response, including per-key failures. On the owner,
+`remote_served_batch_requests` counts groups after successful POSIX reads,
+before UCX completion. `remote_group_fallbacks` counts known-quiescent
+`no_space` responses that cause a group to fall back to per-object loads.
+These count groups, not pages, and omit the legacy single-object path; they
+are not counts of all attempted or successful RPCs. The native default limit
+is 1; a controlled batching profile can set it to 8 in the `agent` config.
+Record the native build marker: older builds omit these fields, while the
+exporter still creates zero-valued series, so zero alone does not establish
+that grouping was disabled or unsupported.
+
 Do not sum these timers into TTFT or label their sum attributable NIXLShard
 overhead. They exclude Python/controller/framework work and overlap concurrent
 I/O; attribution still requires a separately designed measurement. Record

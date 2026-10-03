@@ -62,6 +62,13 @@ class HiCacheNixlShard(HiCacheStorage):
 
         self.storage_config = storage_config
         self.model_revision = revision
+        export_native_metrics = extra.get("export_native_metrics", False)
+        if not isinstance(export_native_metrics, bool):
+            raise ValueError("export_native_metrics must be a boolean")
+        self._export_native_metrics = (
+            export_native_metrics and storage_config.enable_storage_metrics
+        )
+        self._native_exporter = None
         self.agent = nixlshard.Agent(dict(config))
         self.build_marker = getattr(nixlshard, "__build_marker__", "unknown")
         self._condition = threading.Condition()
@@ -378,9 +385,21 @@ class HiCacheNixlShard(HiCacheStorage):
         # Prefix native counters to preserve the adapter's page-level counts.
         # Native counters include private staging, POSIX, and peer-control costs.
         if hasattr(self.agent, "stats"):
-            stats.update(
-                {f"native_{key}": value for key, value in self.agent.stats().items()}
-            )
+            if self._export_native_metrics:
+                # Serialize native snapshots with observations so concurrent callers
+                # cannot feed an older snapshot after a newer one.
+                with self._condition:
+                    if self._native_exporter is None:
+                        from .native_metrics import NativeMetricsExporter
+
+                        self._native_exporter = NativeMetricsExporter(
+                            self.storage_config
+                        )
+                    native = self.agent.stats()
+                    self._native_exporter.observe(native)
+            else:
+                native = self.agent.stats()
+            stats.update({f"native_{key}": value for key, value in native.items()})
         if not self.storage_config.enable_storage_metrics:
             return stats
         return _metrics_snapshot_class()(stats, samples)
@@ -413,6 +432,12 @@ class HiCacheNixlShard(HiCacheStorage):
                 self._condition.notify_all()
             raise
         with self._condition:
+            if self._native_exporter is not None:
+                try:
+                    self._native_exporter.observe(self.agent.stats())
+                except Exception:
+                    # Diagnostics must not prevent cleanup of already-quiescent I/O.
+                    logger.exception("Failed to export NIXLShard shutdown counters")
             self._registrations.clear()
             self._host_buffer = None
             self.mem_pool_host = None

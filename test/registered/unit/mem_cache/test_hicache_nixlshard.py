@@ -130,7 +130,13 @@ class Pool:
         return pointers, lengths
 
 
-def config(revision="abc123", direct_io=False, tp_rank=0):
+def config(
+    revision="abc123",
+    direct_io=False,
+    tp_rank=0,
+    export_native_metrics=False,
+    enable_storage_metrics=True,
+):
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=2,
@@ -139,10 +145,14 @@ def config(revision="abc123", direct_io=False, tp_rank=0):
         attn_cp_rank=0,
         attn_cp_size=1,
         is_mla_model=False,
-        enable_storage_metrics=True,
+        enable_storage_metrics=enable_storage_metrics,
         is_page_first_layout=True,
         model_name="Qwen/Qwen3-32B-FP8",
-        extra_config={"model_revision": revision, "agent": {"direct_io": direct_io}},
+        extra_config={
+            "model_revision": revision,
+            "agent": {"direct_io": direct_io},
+            "export_native_metrics": export_native_metrics,
+        },
     )
 
 
@@ -309,6 +319,106 @@ class TestHiCacheNixlShard(unittest.TestCase):
         self.assertEqual(stats["set_hits"], 1)
         self.assertEqual(stats["native_set_hits"], 99)
         self.assertEqual(stats["native_staged_bytes"], 256)
+
+    def test_native_metrics_opt_in_exports_actual_registry_and_snapshots_once(self):
+        import prometheus_client
+        from prometheus_client import CollectorRegistry, generate_latest
+        from prometheus_client.parser import text_string_to_metric_families
+
+        registry = CollectorRegistry()
+        backend = self.backend(export_native_metrics=True)
+        native = {
+            "posix_read_ns": 2500000000,
+            "posix_read_bytes": 8192,
+            "timeout": 2,
+            "unknown_key_or_peer_field": 123,
+            "staging_free_slots": 8,
+        }
+        with (
+            patch.object(prometheus_client, "REGISTRY", registry),
+            patch.object(backend.agent, "stats", create=True, return_value=native),
+        ):
+            snapshot = backend.get_stats()
+            backend.get_stats()
+            exported = generate_latest(registry).decode()
+            samples = [
+                sample
+                for family in text_string_to_metric_families(exported)
+                for sample in family.samples
+            ]
+
+            def value(name, label, component):
+                return next(
+                    sample.value
+                    for sample in samples
+                    if sample.name == name and sample.labels.get(label) == component
+                )
+
+            self.assertEqual(
+                value(
+                    "sglang:nixlshard_component_seconds_total",
+                    "component",
+                    "posix_read",
+                ),
+                2.5,
+            )
+            self.assertEqual(
+                value(
+                    "sglang:nixlshard_component_bytes_total", "component", "posix_read"
+                ),
+                8192,
+            )
+            self.assertEqual(
+                value("sglang:nixlshard_events_total", "event", "timeout"), 2
+            )
+            self.assertNotIn("unknown_key_or_peer_field", exported)
+            self.assertNotIn("staging_free_slots", exported)
+            self.assertEqual(snapshot["native_posix_read_ns"], 2500000000)
+            backend.close()
+
+    def test_diagnostic_export_failure_does_not_prevent_quiescent_close(self):
+        backend = self.backend()
+        backend._native_exporter = Mock()
+        backend._native_exporter.observe.side_effect = OSError(
+            "diagnostic collector failed"
+        )
+        with (
+            patch.object(backend.agent, "stats", create=True, return_value={}),
+            self.assertLogs(
+                "sglang.srt.mem_cache.storage.nixlshard.hicache_nixlshard",
+                level="ERROR",
+            ),
+        ):
+            backend.close()
+        self.assertTrue(backend._closed)
+        self.assertIsNone(backend._host_buffer)
+
+    def test_native_metrics_require_both_configuration_gates(self):
+        from sglang.srt.mem_cache.storage.nixlshard.native_metrics import (
+            NativeMetricsExporter,
+        )
+
+        for enabled, opt_in in ((False, True), (True, False), (False, False)):
+            with (
+                self.subTest(enable_metrics=enabled, export_native_metrics=opt_in),
+                patch.object(
+                    NativeMetricsExporter,
+                    "__init__",
+                    side_effect=AssertionError("metrics exporter imported/created"),
+                ),
+            ):
+                backend = self.backend(
+                    enable_storage_metrics=enabled, export_native_metrics=opt_in
+                )
+                with patch.object(
+                    backend.agent,
+                    "stats",
+                    create=True,
+                    return_value={"posix_read_ns": 123},
+                ):
+                    self.assertEqual(backend.get_stats()["native_posix_read_ns"], 123)
+                self.assertIsNone(backend._native_exporter)
+                backend.close()
 
     def test_framework_metrics_accept_counter_snapshot_and_drain_samples_once(self):
         from sglang.srt.observability.metrics_collector import (

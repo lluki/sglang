@@ -94,6 +94,49 @@ CUDA runtime; an isolated serving runtime can supply those dependencies.
 Opt-in native tests use disposable files under `/raid/nixlshard-v2` by default.
 Set `NIXLSHARD_TEST_DIR` to select another existing test directory.
 
+## Optional native diagnostics on /metrics
+
+To export native counters, add `"export_native_metrics": true` at the top level
+of the storage extra configuration and launch with `--enable-metrics`. Both
+gates are required; export defaults off. Imports and registry creation remain
+lazy, and CPU/native benchmarks with framework metrics disabled are unaffected.
+This is a separate instrumented profile when comparing overhead.
+
+| Metric family | Unit | Fixed label values |
+| --- | --- | --- |
+| `sglang:nixlshard_component_seconds_total` | seconds | `staging_copy`, `posix_read`, `posix_write`, `remote_control`, `exists_control`, `ucx_write`, `metadata_checkpoint` |
+| `sglang:nixlshard_component_bytes_total` | bytes | `staging_copy`, `posix_read`, `posix_write`, `remote_read`, `ucx_write` |
+| `sglang:nixlshard_events_total` | events | native worker statuses and the fixed resource/failure fields in `native_metrics.py` |
+
+Labels identify the configured model and TP/DP/PP/attention-CP ranks and sizes,
+plus a fixed component or event. Cache keys, peer names, incarnations and
+arbitrary native fields never become labels. Current slot-usage gauges remain
+available only in the `get_stats()` mapping.
+
+The exporter converts cumulative native nanoseconds to seconds and adds only
+the difference since its previous observation. Repeated snapshots do not add
+counts twice. Families are reused on detach/reattach; a replacement Agent has
+its own baseline, and its observed work adds to the existing model/rank totals.
+A lower out-of-order snapshot is ignored rather than treated as an Agent reset.
+The normal Prometheus multiprocess collector exposes worker counters at the
+existing HTTP `/metrics` endpoint. Values update when the backend is collected,
+rather than by querying the Agent from the HTTP process.
+
+These are aggregate wall intervals and counters across native workers and
+background work. `remote_control` includes owner SSD I/O, owner UCX write and
+control response wait; it overlaps owner-side timers. POSIX intervals include
+submission/progress/draining, and successful POSIX bytes include allocation
+padding. Staging bytes are logical gather/scatter bytes and may count both
+directions. Checkpoint timing covers periodic/explicit checkpoints; eager
+reclamation is not timed separately. Event statuses describe batch workers,
+rather than every incoming RPC. Failed exists RPCs contribute to their timer.
+
+Do not sum these timers into TTFT or label their sum attributable NIXLShard
+overhead. They exclude Python/controller/framework work and overlap concurrent
+I/O; attribution still requires a separately designed measurement. Record
+export enablement, source/build markers, per-request cache provenance and raw
+counter snapshots alongside any serving latency results.
+
 ## Local microbenchmark
 
 The harness verifies every round-trip before emitting JSON. Each store round

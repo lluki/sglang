@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 
 import torch
+from sglang.srt.observability import request_timeline
 
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
@@ -69,6 +70,11 @@ class HiCacheNixlShard(HiCacheStorage):
             export_native_metrics and storage_config.enable_storage_metrics
         )
         self._native_exporter = None
+        self._trace_requests = request_timeline.enabled() and config.get(
+            "enable_trace", False
+        )
+        if self._trace_requests and not hasattr(nixlshard.Agent, "trace"):
+            raise ValueError("request tracing requires a native build with Agent.trace")
         self.agent = nixlshard.Agent(dict(config))
         self.build_marker = getattr(nixlshard, "__build_marker__", "unknown")
         self._condition = threading.Condition()
@@ -245,11 +251,13 @@ class HiCacheNixlShard(HiCacheStorage):
             for i in range(0, len(ptrs), stride)
         ]
 
-    def _wait(self, handle, count):
+    def _wait(self, handle, count, request_id=None):
+        terminal_observed = False
         try:
             while True:
                 statuses = self.agent.poll(handle)
                 if statuses is not None:
+                    terminal_observed = True
                     if len(statuses) != count:
                         raise RuntimeError(
                             "nixlshard returned an incomplete batch result"
@@ -261,6 +269,24 @@ class HiCacheNixlShard(HiCacheStorage):
                 # allows the other storage worker and controller to run.
                 time.sleep(0.0005)
         finally:
+            if self._trace_requests and request_id:
+                try:
+                    events = self.agent.trace(handle)
+                    request_timeline.emit(
+                        request_id,
+                        "native_batch",
+                        batch_handle=handle,
+                        build_marker=self.build_marker,
+                        terminal_observed=terminal_observed,
+                        events=events,
+                    )
+                except Exception as error:
+                    request_timeline.emit(
+                        request_id,
+                        "native_trace_error",
+                        batch_handle=handle,
+                        error_type=type(error).__name__,
+                    )
             # Also drains on an exceptional poll; registered buffers remain owned.
             self.agent.release(handle)
 
@@ -274,6 +300,9 @@ class HiCacheNixlShard(HiCacheStorage):
             namespaced = self._keys(keys)
             pages = self._page_segments(keys, host_indices)
             hints = self._hints(extra_info, len(keys))
+            request_id = (
+                (extra_info.extra_info or {}).get("request_id") if extra_info else None
+            )
             results = []
             for first in range(0, len(keys), STORAGE_BATCH_SIZE):
                 batch = pages[first : first + STORAGE_BATCH_SIZE]
@@ -292,7 +321,7 @@ class HiCacheNixlShard(HiCacheStorage):
                     if direction == "get"
                     else self.agent.batch_store
                 )
-                completed = self._wait(submit(items), len(batch))
+                completed = self._wait(submit(items), len(batch), request_id)
                 results.extend(completed)
             with self._condition:
                 self._stats[f"{direction}_pages"] += len(results)
@@ -323,9 +352,28 @@ class HiCacheNixlShard(HiCacheStorage):
         if not keys:
             return 0
         with self._operation():
-            found = self.agent.batch_exists(
-                self._keys(keys), self._hints(extra_info, len(keys))
+            request_id = (
+                (extra_info.extra_info or {}).get("request_id") if extra_info else None
             )
+            start_ns = (
+                time.monotonic_ns()
+                if request_id and request_timeline.enabled()
+                else None
+            )
+            try:
+                found = self.agent.batch_exists(
+                    self._keys(keys), self._hints(extra_info, len(keys))
+                )
+            finally:
+                if start_ns is not None:
+                    request_timeline.emit(
+                        request_id,
+                        "metadata_query",
+                        start_ns,
+                        time.monotonic_ns(),
+                        object_count=len(keys),
+                        scope="caller-visible existence/owner-verification call",
+                    )
             if len(found) != len(keys):
                 raise RuntimeError("nixlshard returned an incomplete exists result")
             return found.index(False) if False in found else len(found)

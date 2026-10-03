@@ -1322,6 +1322,7 @@ class Req(ReqDllmMixin):
         else:
             self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
         self.time_stats.set_metrics_collector(metrics_collector)
+        self.time_stats.timeline_rid = rid
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
 

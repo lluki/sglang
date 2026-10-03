@@ -25,6 +25,7 @@ from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability import request_timeline
 from sglang.srt.observability.metrics_collector import (
     EncoderMetricsCollector,
     SchedulerMetricsCollector,
@@ -240,6 +241,7 @@ class ReqTimeStatsBase:
     )
     disagg_mode: DisaggregationMode = DisaggregationMode.NULL
     diff_realtime_monotonic: float = 0.0
+    timeline_rid: str = ""
 
     @classmethod
     def new_from_obj(cls, obj: Optional[ReqTimeStatsBase], *args, **kwargs) -> Self:
@@ -404,6 +406,7 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def set_created_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.created_time = ts
+        request_timeline.emit(self.timeline_rid, "api_request_received", int(ts * 1e9))
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_req_start(convert_time_to_realtime_ns(ts))
@@ -668,6 +671,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         calibrate_time_diff()
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
+        request_timeline.emit(self.timeline_rid, "scheduler_received", int(ts * 1e9))
 
     def set_spec_draft_start_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -768,6 +772,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         if self.forward_entry_time == 0.0:
             self.forward_entry_time = ts
+            request_timeline.emit(
+                self.timeline_rid, "first_forward_entry", int(ts * 1e9)
+            )
             self.last_forward_entry_time = ts
 
             if self.enable_metrics:
@@ -814,6 +821,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         if self.prefill_finished_time == 0.0:
             self.prefill_finished_time = ts
+            request_timeline.emit(
+                self.timeline_rid, "first_prefill_result", int(ts * 1e9)
+            )
             self.last_prefill_finished_time = ts
 
             stage = RequestStage.PREFILL_FORWARD

@@ -217,3 +217,32 @@ each round. These are synthetic CPU KV/file measurements. They do not measure mo
 TTFT or remote RDMA. Native cost counters may overlap; do not add them into a
 latency decomposition. Filesystem/page-cache behavior and direct-I/O mode must
 be reported when sharing results.
+
+## Optional per-request timelines
+
+Set `SGLANG_REQUEST_TIMELINE_DIR=/scratch/UNIQUE-RUN/request-timeline` before
+launch and add `"enable_trace": true` inside the `agent` configuration.
+Native `1a8ecc107a1e` or a newer trace-capable build is required on both endpoints.
+These diagnostics default off and are separate from the Prometheus exporter.
+
+The API process records request-state creation and its first nonempty output.
+The scheduler records receipt, first-forward entry and the completed prefill
+result. The controller passes the explicit serving request ID through existence
+queries and prefetch loads. The adapter captures each terminal native batch's
+trace before release, preserving request IDs, handles and native RPC tickets.
+One flushed JSONL file per process avoids cross-process append races. No model
+outputs, cache keys or memory addresses are logged. File errors never fail I/O.
+
+Python and native intervals use the requester's Linux CLOCK_MONOTONIC. A client
+joining absolute timestamps must run on the same kernel and verify the serving
+boot ID. Owner POSIX/UCX values are durations nested inside the requester RPC,
+not absolute owner timestamps. First-forward through prefill-result includes
+actual asynchronous H2D/model overlap; its duration must not be added to
+overlapping individual CUDA or native timers. Records preserve raw overlaps.
+
+Trace serialization and file flushing add diagnostic work to measured serving.
+Publish these runs as instrumented profiles with exact source/build markers;
+they do not establish uninstrumented overhead. The NIXL `bench-ttft.py` harness
+can join explicit request IDs with `--request-trace-dir` and
+`--request-trace-boot-id`, retain raw events, verify exact payload coverage,
+and produce an exclusive requester wall-time partition with unknown gaps.

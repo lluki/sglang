@@ -121,6 +121,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.observability import request_timeline
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -2551,6 +2552,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             if out_dict is not None:
+                request_timeline.first_output(state, rid, out_dict)
                 state.out_list.append(out_dict)
                 pending_notify[rid] = state
 
@@ -3541,6 +3543,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+            time_stats.timeline_rid = rid
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
             if self.enable_trace:

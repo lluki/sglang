@@ -150,6 +150,52 @@ I/O; attribution still requires a separately designed measurement. Record
 export enablement, source/build markers, per-request cache provenance and raw
 counter snapshots alongside any serving latency results.
 
+## Optional bounded remote page batching
+
+For 16 MiB logical pages, this addition to the existing `agent` configuration
+allows up to eight consecutive pages belonging to the same owner per remote
+load RPC, within a 128 MiB private staging slot:
+
+```json
+{
+  "agent": {
+    "remote_batch_limit": 8,
+    "staging_slot_bytes": 134217728,
+    "staging_slots": 4,
+    "workers": 2
+  }
+}
+```
+
+Merge these fields into each endpoint's complete agent configuration. Use a
+native build supporting grouped remote loads on both endpoints, with matching
+model revision, KV schema and page geometry. Each agent reserves 512 MiB of
+private staging in this example. The default `remote_batch_limit` remains 1;
+grouping also respects slot capacity and falls back to individual loads after
+a known-quiescent owner `no_space` response. Caller buffers retain the existing
+registration, cancellation and completion rules.
+
+The matched GB200 experiment used native `ff5aa4879101` and serving SGLang
+`cfe719424937`, Qwen3-32B-FP8 with BF16 KV, page size 64, a 16 GB host cache,
+and one request outstanding. Five measured streaming requests per context,
+after one warmup, reduced median remote TTFT by 5.7% to 17.3% for 512 through
+8192 tokens. At 8192 tokens, median TTFT was 415.27 ms with limit 1 and
+343.26 ms with limit 8; both transferred exactly 2032 MiB from owner
+file-backed storage to requester host memory. Group and cleanup counters
+confirmed 16 transactions
+with limit 8 versus 127 individual transactions, with no group fallbacks.
+Raw run IDs are `20261003-135511-batch1` (corrected attempt 2) and
+`20261003-141001-batch8`. These measurements retain the serving commit above;
+subsequent documentation commits do not change that runtime pin.
+
+For `page_first_direct`, each page has two contiguous 8 MiB segments, K then
+V, separated by half the host pool. Native copies remain serial. Requester
+staging timers were approximately 153–156 ms at 8192 tokens in both profiles.
+A next experiment should isolate copies with the same registered buffers and
+measure thread/memory placement before testing bounded copy parallelism that
+joins before publishing completion. These timer windows overlap other work
+and do not establish an additive TTFT breakdown.
+
 ## Local microbenchmark
 
 The harness verifies every round-trip before emitting JSON. Each store round

@@ -14,6 +14,45 @@ from sglang.srt.observability import request_timeline
 
 
 class TestRequestTimeline(unittest.TestCase):
+    def test_unified_override_preserves_request_id_and_prefix_without_changing_hit_query(
+        self,
+    ):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+            PrefetchOperation,
+        )
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        controller = object.__new__(HybridCacheController)
+        controller.page_size = 2
+        seen = []
+        controller.storage_backend = SimpleNamespace(
+            batch_exists=lambda keys, extra: (seen.append((keys, extra)), 1)[1]
+        )
+        for enabled in (False, True):
+            operation = PrefetchOperation(
+                CacheRequestHandle("actual-request", 0),
+                [1, 2, 3, 4],
+                prefix_keys=["parent"],
+            )
+            with patch.object(
+                request_timeline, "_directory", "enabled" if enabled else None
+            ):
+                keys, tokens = controller._storage_hit_query(operation)
+            self.assertEqual(tokens, 2)
+            self.assertEqual(keys, seen[-1][0][:1])
+            extra = seen[-1][1]
+            self.assertEqual(extra.prefix_keys, ["parent"])
+            self.assertIsNot(extra.prefix_keys, operation.prefix_keys)
+            self.assertEqual(
+                extra.extra_info, {"request_id": "actual-request"} if enabled else None
+            )
+        count = len(seen)
+        operation.assume_stored = True
+        keys, tokens = controller._storage_hit_query(operation)
+        self.assertEqual(tokens, 4)
+        self.assertEqual(len(seen), count)
+
     def records(self, directory):
         return [
             json.loads(line)

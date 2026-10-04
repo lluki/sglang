@@ -661,6 +661,13 @@ class HiCacheController:
             # to avoid flipping `enable_storage` flags while threads are still alive.
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
+        # A direct receiver may still own caller rows after logical timeout.
+        # Its close must establish quiescence before detach can discard the
+        # backend or allow a replacement pool/reset. Preserve state on failure.
+        direct_receive = getattr(self.storage_backend, "direct_receive", False)
+        if direct_receive:
+            self.storage_backend.close()
+
         # Best-effort destroy process groups created for storage ops.
         self._destroy_sync_groups(
             self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
@@ -674,6 +681,7 @@ class HiCacheController:
                 hasattr(self, "storage_backend")
                 and self.storage_backend is not None
                 and hasattr(self.storage_backend, "close")
+                and not direct_receive
             ):
                 self.storage_backend.close()
         except Exception:

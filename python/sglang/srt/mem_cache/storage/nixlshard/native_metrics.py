@@ -22,6 +22,8 @@ BYTES = (
     "posix_write_bytes",
     "remote_read_bytes",
     "ucx_write_bytes",
+    "direct_receive_bytes",
+    "direct_local_read_bytes",
 )
 EVENTS = (
     "success",
@@ -47,6 +49,10 @@ EVENTS = (
     "remote_load_batch_requests",
     "remote_served_batch_requests",
     "remote_group_fallbacks",
+    "direct_receive_segments",
+    "direct_quarantined_batches",
+    "direct_quarantines_released",
+    "local_direct_fallbacks",
     "checkpoint_errors",
     "metadata_announce_errors",
     "metadata_connection_failures",

@@ -130,7 +130,10 @@ from sglang.srt.mem_cache.storage.nixlshard.native_metrics import NativeMetricsE
 config = SimpleNamespace(model_name="test-model", tp_rank=0, tp_size=2, dp_rank=0,
                          pp_rank=0, pp_size=1, attn_cp_rank=0, attn_cp_size=1)
 exporter = NativeMetricsExporter(config)
-exporter.observe({"posix_write_ns": 2000000000, "posix_write_bytes": 8192, "timeout": 1})
+exporter.observe({"posix_write_ns": 2000000000, "posix_write_bytes": 8192, "timeout": 1,
+                  "direct_receive_bytes": 32768, "direct_local_read_bytes": 8192,
+                  "direct_receive_segments": 4, "direct_quarantined_batches": 1,
+                  "direct_quarantines_released": 1, "local_direct_fallbacks": 2})
 exporter.observe({"posix_write_ns": 2000000000, "posix_write_bytes": 8192, "timeout": 1})
 batch_events = {"remote_load_batch_requests": 3, "remote_served_batch_requests": 4,
                 "remote_group_fallbacks": 1}
@@ -178,10 +181,30 @@ exporter.observe({"remote_load_batch_requests": 5, "remote_served_batch_requests
                 ("remote_load_batch_requests", 5),
                 ("remote_served_batch_requests", 6),
                 ("remote_group_fallbacks", 2),
+                ("direct_receive_segments", 4),
+                ("direct_quarantined_batches", 1),
+                ("direct_quarantines_released", 1),
+                ("local_direct_fallbacks", 2),
             ):
                 with self.subTest(event=event):
                     self.assertEqual(
-                        value(registry, "sglang:nixlshard_events_total", "event", event),
+                        value(
+                            registry, "sglang:nixlshard_events_total", "event", event
+                        ),
+                        expected,
+                    )
+            for component, expected in (
+                ("direct_receive", 32768),
+                ("direct_local_read", 8192),
+            ):
+                with self.subTest(component=component):
+                    self.assertEqual(
+                        value(
+                            registry,
+                            "sglang:nixlshard_component_bytes_total",
+                            "component",
+                            component,
+                        ),
                         expected,
                     )
 

@@ -60,6 +60,205 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
         self.assertNotEqual(backend.build_marker, "unknown")
         return backend
 
+    def test_direct_remote_scatter_proves_final_destinations_and_zero_receiver_copy(
+        self,
+    ):
+        import nixlshard
+
+        if not (
+            getattr(nixlshard, "direct_receive_supported", False)
+            or getattr(nixlshard.Agent, "direct_receive_supported", False)
+        ):
+            self.skipTest("requires the direct-receive native candidate")
+        with tempfile.TemporaryDirectory(
+            dir=os.environ.get("NIXLSHARD_TEST_DIR", "/raid/nixlshard-v2")
+        ) as directory, patch.object(request_timeline, "_directory", directory):
+
+            def qwen_pool():
+                pool = Pool("page_first_direct", dtype=torch.bfloat16)
+                pool.page_size, pool.size = 64, 256
+                pool.layer_num, pool.head_num, pool.head_dim = 64, 8, 128
+                pool.kv_buffer = torch.empty((2, 256, 64, 8, 128), dtype=pool.dtype)
+                pool.clear()
+                pool.alloc(pool.size)
+                for kv in range(2):
+                    for page in range(4):
+                        pool.kv_buffer[kv, page * 64 : (page + 1) * 64].fill_(
+                            17 + kv * 10 + page
+                        )
+                return pool
+
+            owner_pool, reader_pool = qwen_pool(), qwen_pool()
+            owner = self.backend(
+                owner_pool,
+                directory,
+                True,
+                staging_slot_bytes=128 * 1024**2,
+                disks=[
+                    dict(
+                        path=os.path.join(directory, "qwen-cache.bin"),
+                        capacity_bytes=128 * 1024**2,
+                        unit_bytes=64 * 1024,
+                        metadata_bytes=1024**2,
+                        create=True,
+                    )
+                ],
+            )
+            keys = ["direct-a", "direct-b"]
+            expected = owner_pool.kv_buffer[:, :128].clone()
+            indices = torch.arange(128)
+            self.assertEqual(owner.batch_set_v1(keys, indices), [True, True])
+            reader_pool.kv_buffer.zero_()
+            owner_name = owner.storage_config.extra_config["agent"]["name"]
+            reader = self.backend(
+                reader_pool,
+                directory,
+                True,
+                disks=[],
+                direct_receive=True,
+                enable_trace=True,
+                remote_batch_limit=8,
+                staging_slot_bytes=128 * 1024**2,
+                peers={owner_name: owner.agent.endpoint()},
+            )
+            hints = HiCacheStorageExtraInfo(
+                extra_info={
+                    "owner_hints": [owner_name] * 2,
+                    "request_id": "direct-scatter",
+                }
+            )
+            deadline = time.monotonic() + 5
+            while reader.batch_exists(keys, hints) != 2:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            before, start = reader.agent.stats(), time.monotonic_ns()
+            self.assertEqual(reader.batch_get_v1(keys, indices, hints), [True, True])
+            end, after = time.monotonic_ns(), reader.agent.stats()
+            payload_bytes = reader._page_bytes * 2
+            self.assertEqual(
+                after.get("direct_receive_bytes", 0)
+                - before.get("direct_receive_bytes", 0),
+                payload_bytes,
+            )
+            self.assertEqual(
+                after.get("remote_read_bytes", 0) - before.get("remote_read_bytes", 0),
+                payload_bytes,
+            )
+            self.assertEqual(
+                after.get("direct_receive_segments", 0)
+                - before.get("direct_receive_segments", 0),
+                4,
+            )
+            self.assertEqual(
+                after.get("staging_copy_bytes", 0)
+                - before.get("staging_copy_bytes", 0),
+                0,
+            )
+            torch.testing.assert_close(reader_pool.kv_buffer[:, :128], expected)
+            self.assertEqual(reader_pool.kv_buffer[:, 128:].count_nonzero().item(), 0)
+            self.assertEqual(reader_pool._io_leases, {})
+            records = [
+                json.loads(line)
+                for path in Path(directory).glob("request-timeline-*.jsonl")
+                for line in path.read_text().splitlines()
+            ]
+            events = [
+                e
+                for r in records
+                if r["rid"] == "direct-scatter" and r["stage"] == "native_batch"
+                for e in r["events"]
+            ]
+            self.assertFalse(any(e["stage"] == "staging_copy" for e in events))
+            rpc = [e for e in events if e["stage"] == "remote_rpc" and e["bytes"]]
+            self.assertEqual(sum(e["bytes"] for e in rpc), payload_bytes)
+            self.assertEqual(sum(e["destination_segments"] for e in rpc), 4)
+            for event in rpc:
+                self.assertTrue(event["direct_receive"])
+                self.assertLessEqual(start, event["start_ns"])
+                self.assertLessEqual(event["end_ns"], end)
+
+    def test_local_direct_reads_use_aligned_rows_and_unaligned_pages_report_fallback(
+        self,
+    ):
+        import nixlshard
+
+        if not getattr(nixlshard.Agent, "direct_receive_supported", False):
+            self.skipTest("requires the direct-receive native candidate")
+        for aligned in (False, True):
+            with self.subTest(aligned=aligned), tempfile.TemporaryDirectory(
+                dir=os.environ.get("NIXLSHARD_TEST_DIR", "/raid/nixlshard-v2")
+            ) as directory, patch.object(request_timeline, "_directory", directory):
+                pool = Pool("page_first_direct")
+                if aligned:
+                    pool.head_dim = 256
+                    elements = 2 * pool.size * pool.layer_num * pool.head_dim
+                    allocation = torch.empty(elements * 4 + 4096, dtype=torch.uint8)
+                    offset = (-allocation.data_ptr()) % 4096
+                    pool.kv_buffer = (
+                        allocation[offset : offset + elements * 4]
+                        .view(torch.float32)
+                        .reshape(2, pool.size, pool.layer_num, 1, pool.head_dim)
+                    )
+                    pool.kv_buffer.copy_(
+                        torch.arange(elements).reshape(pool.kv_buffer.shape)
+                    )
+                backend = self.backend(
+                    pool,
+                    directory,
+                    True,
+                    direct_receive=True,
+                    enable_trace=True,
+                    staging_slot_bytes=16384,
+                )
+                expected = pool.kv_buffer[:, :4].clone()
+                keys = ["local-direct-a", "local-direct-b"]
+                self.assertEqual(
+                    backend.batch_set_v1(keys, torch.arange(4)), [True, True]
+                )
+                before = backend.agent.stats()
+                pool.kv_buffer[:, :4].zero_()
+                extra = HiCacheStorageExtraInfo(
+                    extra_info={"request_id": "local-direct"}
+                )
+                self.assertEqual(
+                    backend.batch_get_v1(keys, torch.arange(4), extra), [True, True]
+                )
+                after = backend.agent.stats()
+                payload_bytes = backend._page_bytes * 2
+
+                def delta(name):
+                    return after.get(name, 0) - before.get(name, 0)
+
+                self.assertEqual(
+                    delta("posix_read_bytes"), payload_bytes if aligned else 8192
+                )
+                self.assertEqual(
+                    delta("direct_local_read_bytes"), payload_bytes if aligned else 0
+                )
+                self.assertEqual(
+                    delta("direct_receive_bytes"), payload_bytes if aligned else 0
+                )
+                self.assertEqual(
+                    delta("staging_copy_bytes"), 0 if aligned else payload_bytes
+                )
+                self.assertEqual(delta("local_direct_fallbacks"), 0 if aligned else 2)
+                torch.testing.assert_close(pool.kv_buffer[:, :4], expected)
+                events = [
+                    e
+                    for path in Path(directory).glob("request-timeline-*.jsonl")
+                    for line in path.read_text().splitlines()
+                    for r in [json.loads(line)]
+                    if r["rid"] == "local-direct" and r["stage"] == "native_batch"
+                    for e in r["events"]
+                    if e["stage"] == "local_posix"
+                ]
+                self.assertEqual(
+                    sum(e["bytes"] for e in events), payload_bytes if aligned else 8192
+                )
+                self.assertTrue(
+                    all(e.get("direct_receive", False) == aligned for e in events)
+                )
+
     def test_trace_clock_brackets_local_and_remote(self):
         import nixlshard
 

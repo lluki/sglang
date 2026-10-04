@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 
 
@@ -36,6 +37,7 @@ class FakeAgent:
         self.poll_barrier = None
         self.closed = False
         self.lock = threading.Lock()
+        self.quiescence = {}
 
     def register_memory(self, address, length):
         token = len(self.regions) + 1
@@ -87,7 +89,12 @@ class FakeAgent:
                 statuses.append("success")
         return statuses
 
+    def is_quiescent(self, handle):
+        event = self.quiescence.get(handle)
+        return event is None or event.is_set()
+
     def release(self, handle):
+        assert self.is_quiescent(handle)
         self.released.append(handle)
 
     def batch_exists(self, keys, hints=None):
@@ -99,6 +106,17 @@ class FakeAgent:
 
 
 class Pool:
+    # Exercise the real framework allocation/lease methods on a tiny CPU pool.
+    clear = HostKVCache.clear
+    alloc = HostKVCache.alloc
+    free = HostKVCache.free
+    available_size = HostKVCache.available_size
+    _merge_release_slots = HostKVCache._merge_release_slots
+    acquire_io_lease = HostKVCache.acquire_io_lease
+    release_io_lease = HostKVCache.release_io_lease
+    logical_size = property(lambda self: self.size)
+    logical_page_size = property(lambda self: self.page_size)
+
     def __init__(self, layout="page_first", dtype=torch.float32):
         self.layout = layout
         self.page_size = 2
@@ -109,6 +127,10 @@ class Pool:
         self.dtype = dtype
         shape = (2, 2, 8, 1, 4) if layout == "layer_first" else (2, 8, 2, 1, 4)
         self.kv_buffer = torch.arange(128).reshape(shape).to(dtype)
+        self.device = "cpu"
+        self.lock = threading.RLock()
+        self.clear()
+        self.alloc(self.size)
 
     def get_page_buffer_meta(self, indices):
         pointers, lengths = [], []
@@ -133,6 +155,7 @@ class Pool:
 def config(
     revision="abc123",
     direct_io=False,
+    direct_receive=False,
     tp_rank=0,
     export_native_metrics=False,
     enable_storage_metrics=True,
@@ -150,7 +173,7 @@ def config(
         model_name="Qwen/Qwen3-32B-FP8",
         extra_config={
             "model_revision": revision,
-            "agent": {"direct_io": direct_io},
+            "agent": {"direct_io": direct_io, "direct_receive": direct_receive},
             "export_native_metrics": export_native_metrics,
         },
     )
@@ -203,6 +226,211 @@ class TestHiCacheNixlShard(unittest.TestCase):
                 torch.testing.assert_close(pool.kv_buffer, expected)
                 self.assertEqual(len(backend.agent.regions), 1)
                 self.assertEqual(len(backend.agent.released), 2)
+
+    def test_direct_receive_requires_capable_native_and_boolean_config(self):
+        for direct in (True, "true", 1):
+            with self.subTest(direct=direct), self.assertRaises(ValueError):
+                self.backend(direct_receive=direct)
+        self.assertEqual(self.backends, [])
+
+    def test_direct_receive_uses_final_kv_rows_and_same_storage_namespace(self):
+        sys.modules["nixlshard"].direct_receive_supported = True
+        for layout in ("page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                pool = Pool(layout)
+                staged = self.backend(pool)
+                direct = self.backend(pool, direct_receive=True)
+                self.assertTrue(direct.direct_receive)
+                self.assertEqual(direct.namespace, staged.namespace)
+                expected = pool.kv_buffer[:, 2:4].clone()
+                indices = torch.tensor([2, 3])
+                self.assertEqual(direct.batch_set_v1(["a"], indices), [True])
+                pool.kv_buffer[:, 2:4].zero_()
+                self.assertEqual(direct.batch_get_v1(["a"], indices), [True])
+                torch.testing.assert_close(pool.kv_buffer[:, 2:4], expected)
+                token, capacity = next(iter(direct.agent.regions.items()))
+                self.assertEqual(
+                    capacity, (pool.kv_buffer.data_ptr(), pool.kv_buffer.nbytes)
+                )
+                segments = direct.agent.submissions[-1][1][0]["segments"]
+                self.assertEqual(len(segments), 2)
+                for kv, (region, offset, length) in enumerate(segments):
+                    destination = pool.kv_buffer[kv, 2:4]
+                    self.assertEqual(region, token)
+                    self.assertEqual(capacity[0] + offset, destination.data_ptr())
+                    self.assertEqual(length, destination.nbytes)
+
+    def test_direct_receive_rejects_unsupported_layout_without_registration(self):
+        sys.modules["nixlshard"].direct_receive_supported = True
+        for layout in ("page_head", "layer_first"):
+            with self.subTest(layout=layout):
+                backend = StorageBackendFactory.create_backend(
+                    "nixlshard", config(direct_receive=True), Pool(layout)
+                )
+                self.backends.append(backend)
+                with self.assertRaisesRegex(NotImplementedError, "direct_receive"):
+                    backend.register_mem_pool_host(Pool(layout))
+                self.assertEqual(backend.agent.regions, {})
+
+    def test_failed_direct_receive_defers_free_until_late_dma_quiescence(self):
+        sys.modules["nixlshard"].direct_receive_supported = True
+        pool = Pool("page_first_direct")
+        backend = self.backend(pool, direct_receive=True)
+        unsafe = threading.Event()
+        backend.agent.quiescence[0] = unsafe
+        original_poll = backend.agent.poll
+        with patch.object(
+            backend.agent,
+            "poll",
+            side_effect=lambda h: ["timeout"] if h == 0 else original_poll(h),
+        ):
+            self.assertEqual(backend.batch_get_v1(["late"], torch.arange(2)), [False])
+            pool.free(torch.arange(2))  # Controller completed_req/abort tail release.
+            self.assertEqual(pool.available_size(), 0)
+            self.assertTrue(pool.slot_used[:2].all())
+            with self.assertRaisesRegex(RuntimeError, "I/O leases"):
+                pool.clear()
+            with self.assertRaisesRegex(RuntimeError, "I/O lease"):
+                backend.batch_get_v1(["overlap"], torch.arange(2))
+            # Healthy unrelated destinations still complete while the failed
+            # remote connection may write the quarantined rows at any time.
+            self.assertEqual(
+                backend.batch_get_v1(["healthy-miss"], torch.arange(2, 4)), [False]
+            )
+            self.assertEqual(backend.agent.released, [1])
+            with self.assertRaisesRegex(RuntimeError, "quarantines"):
+                backend.close()
+            self.assertIs(backend._host_buffer, pool.kv_buffer)
+            self.assertFalse(backend.agent.closed)
+            # Simulate the previously posted NIC write arriving after timeout
+            # and framework free. It cannot corrupt a newly allocated page.
+            pool.kv_buffer[:, :2].fill_(999)
+            self.assertIsNone(pool.alloc(2))
+            unsafe.set()
+            with backend._condition:
+                self.assertTrue(
+                    backend._condition.wait_for(
+                        lambda: not backend._quarantined, timeout=2
+                    )
+                )
+            self.assertEqual(pool.alloc(2).tolist(), [0, 1])
+            self.assertEqual(backend.agent.released, [1, 0])
+        backend.close()
+
+    def test_quarantine_thread_start_failure_roots_pool_and_can_retry(self):
+        from sglang.srt.mem_cache.storage.nixlshard.hicache_nixlshard import (
+            _quarantine_owners,
+        )
+
+        sys.modules["nixlshard"].direct_receive_supported = True
+        pool = Pool()
+        backend = self.backend(pool, direct_receive=True)
+        unsafe = threading.Event()
+        backend.agent.quiescence[0] = unsafe
+        with patch.object(
+            backend.agent, "poll", return_value=["timeout"]
+        ), patch.object(
+            threading.Thread, "start", side_effect=RuntimeError("no thread resources")
+        ), self.assertLogs(
+            "sglang.srt.mem_cache.storage.nixlshard.hicache_nixlshard", level="ERROR"
+        ):
+            self.assertEqual(backend.batch_get_v1(["late"], torch.arange(2)), [False])
+        self.assertIsNone(backend._quarantine_thread)
+        pool.free(torch.arange(2))
+        reference, tensor = weakref.ref(backend), weakref.ref(pool.kv_buffer)
+        self.backends.remove(backend)
+        del backend, pool
+        gc.collect()
+        self.assertIsNotNone(reference())
+        self.assertIsNotNone(tensor())
+        backend = reference()
+        self.assertIn(backend, _quarantine_owners)
+        unsafe.set()
+        with backend._condition:
+            backend._start_quarantine_reaper()
+            self.assertTrue(
+                backend._condition.wait_for(
+                    lambda: backend not in _quarantine_owners, timeout=2
+                )
+            )
+        backend.close()
+        del backend
+        gc.collect()
+        self.assertIsNone(reference())
+        self.assertIsNone(tensor())
+
+    def test_unsafe_native_success_is_not_published_and_quarantine_is_bounded(self):
+        sys.modules["nixlshard"].direct_receive_supported = True
+        storage_config = config(direct_receive=True)
+        storage_config.extra_config["agent"]["max_inflight"] = 1
+        pool = Pool()
+        backend = StorageBackendFactory.create_backend(
+            "nixlshard", storage_config, pool
+        )
+        backend.register_mem_pool_host(pool)
+        self.backends.append(backend)
+        unsafe = threading.Event()
+        backend.agent.quiescence[0] = unsafe
+        try:
+            with patch.object(backend.agent, "poll", return_value=["success"]):
+                self.assertEqual(
+                    backend.batch_get_v1(["unsafe"], torch.arange(2)), [False]
+                )
+                self.assertEqual(
+                    backend.batch_get_v1(["bounded"], torch.arange(2, 4)), [False]
+                )
+            self.assertEqual(len(backend.agent.submissions), 1)
+            self.assertEqual(backend._direct_live, 1)
+            self.assertEqual(backend._stats["direct_quarantine_busy"], 1)
+        finally:
+            unsafe.set()
+            with backend._condition:
+                self.assertTrue(
+                    backend._condition.wait_for(
+                        lambda: not backend._quarantined, timeout=2
+                    )
+                )
+
+    def test_host_io_lease_defers_only_leased_rows_and_rejects_aliases(self):
+        pool = Pool()
+        lease = pool.acquire_io_lease(torch.arange(2))
+        with self.assertRaises(ValueError):
+            pool.acquire_io_lease(torch.tensor([2, 2]))
+        with self.assertRaisesRegex(RuntimeError, "already"):
+            pool.acquire_io_lease(torch.arange(2))
+        pool.free(torch.arange(4))
+        self.assertEqual(pool.alloc(2).tolist(), [2, 3])
+        with self.assertRaisesRegex(AssertionError, "Double-free"):
+            pool.free(torch.arange(2))
+        self.assertIsNone(pool.alloc(2))
+        pool.release_io_lease(lease)
+        self.assertEqual(pool.alloc(2).tolist(), [0, 1])
+        with self.assertRaises(KeyError):
+            pool.release_io_lease(lease)
+        pool.clear()  # Reset allowed only after all external DMA is quiescent.
+        with self.assertRaisesRegex(RuntimeError, "allocated"):
+            pool.acquire_io_lease(torch.arange(2))
+
+    def test_detach_preserves_direct_backend_and_groups_until_quiescent_close(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller._stop_storage_threads = Mock()
+        controller._destroy_sync_groups = Mock()
+        controller.storage_backend = Mock(direct_receive=True)
+        controller.storage_backend.close.side_effect = RuntimeError(
+            "quarantined receive"
+        )
+        controller.enable_storage = True
+        controller.prefetch_hits_sync_groups = [object()]
+        controller.prefetch_completion_sync_groups = [object()]
+        retained = controller.storage_backend
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            controller.detach_storage_backend()
+        self.assertIs(controller.storage_backend, retained)
+        self.assertTrue(controller.enable_storage)
+        controller._destroy_sync_groups.assert_not_called()
+        self.assertEqual(len(controller.prefetch_hits_sync_groups), 1)
 
     def test_prefix_exists_and_miss_after_exists(self):
         backend = self.backend()

@@ -196,6 +196,47 @@ measure thread/memory placement before testing bounded copy parallelism that
 joins before publishing completion. These timer windows overlap other work
 and do not establish an additive TTFT breakdown.
 
+## Optional direct reception into host KV pages
+
+With a native build advertising `Agent.direct_receive_supported` and
+`Agent.is_quiescent`, set `"direct_receive": true` inside `agent`. It defaults
+to false. Use `page_first` or `page_first_direct`; other layouts fail explicitly
+in this mode. The adapter registers the entire CPU KV pool once. For the Qwen
+BF16/page64 profile, an owner UCX write scatters each 16 MiB page directly into
+its final 8 MiB K and 8 MiB V rows, eliminating the requester staging copy.
+Keep `remote_batch_limit: 8` and the same four 128 MiB slots on both endpoints
+for a matched staged/direct comparison. Owner SSD reads still use registered
+owner staging; direct reception does not mean SSD-to-NIC or host-to-GPU bypass.
+
+Direct local reads additionally require 4 KiB aligned destinations and segment
+lengths with physical allocation exactly equal to the logical object. Ineligible
+local reads use safe private staging and increment `local_direct_fallbacks`.
+Remote direct loads retain scatter reception even when the owner shrinks a
+group. `direct_receive_bytes`, `direct_local_read_bytes` and
+`direct_receive_segments`, plus per-handle trace flags, distinguish these paths.
+The optional native Prometheus exporter publishes these fixed counters; its
+timer windows remain nonadditive.
+
+Every direct read acquires exclusive I/O leases on allocated host rows before
+submission. A logical timeout may return a miss promptly while a bounded
+background reaper retains the native handle, full host pool and leases. A
+framework free defers those rows; pool clear rejects active leases. They become
+reusable only after `is_quiescent` and native release succeed. An unsafe native
+success is never published for H2D. Close/detach with pending quarantines fails
+and preserves ownership so callers can retry after cleanup. If the remote
+owner never establishes quiescence, those bounded rows remain unavailable;
+healthy reads may use other rows. Holding the tensor alone would not fence the
+host allocator. The adapter also keeps process-rooted ownership if its reaper
+thread cannot start.
+
+`test_hicache_nixlshard_native` includes actual POSIX/UCX tests for final K/V
+scatter destinations, exact direct bytes and zero receiver copies, aligned
+local direct reads, and explicit unaligned local fallback. CPU contract tests
+exercise deferred free, late-write safety, overlapping leases, bounded
+quarantine admission and failed thread startup. Serving performance requires
+a fresh matched hardware/runtime cohort with explicit direct-receive proof;
+the historical measurements above used private receiver staging.
+
 ## Local microbenchmark
 
 The harness verifies every round-trip before emitting JSON. Each store round

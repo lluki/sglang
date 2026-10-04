@@ -333,6 +333,12 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def clear(self):
+        if getattr(self, "_io_leases", None):
+            raise RuntimeError("cannot clear a host pool with active I/O leases")
+        self._io_leases = {}
+        self._io_lease_next = getattr(self, "_io_lease_next", 0)
+        self._io_leased = torch.zeros(self.logical_size, dtype=torch.bool)
+        self._io_free_pending = torch.zeros(self.logical_size, dtype=torch.bool)
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
             (self.logical_size,), dtype=torch.uint8, device=self.device
@@ -373,9 +379,9 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert need_size % self.logical_page_size == 0, (
-            "The requested size should be a multiple of the page size."
-        )
+        assert (
+            need_size % self.logical_page_size == 0
+        ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
 
@@ -403,7 +409,58 @@ class HostKVCache(abc.ABC):
             f"Double-free detected: slots not currently allocated: "
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
         )
-        self.slot_used[indices_cpu] = False
-        self.release_slots.append(indices_cpu)
-        self.num_release_slots += len(indices_cpu)
+        if not self._io_leases:
+            self.slot_used[indices_cpu] = False
+            self.release_slots.append(indices_cpu)
+            self.num_release_slots += len(indices_cpu)
+            return len(indices)
+        assert not self._io_free_pending[
+            indices_cpu
+        ].any(), "Double-free detected: host slots already await I/O quiescence"
+        leased = self._io_leased[indices_cpu]
+        self._io_free_pending[indices_cpu[leased]] = True
+        released = indices_cpu[~leased]
+        self.slot_used[released] = False
+        if released.numel():
+            self.release_slots.append(released)
+            self.num_release_slots += len(released)
         return len(indices)
+
+    @synchronized
+    def acquire_io_lease(self, indices: torch.Tensor) -> int:
+        """Keep allocated receive rows unavailable until DMA is quiescent.
+
+        Leases are exclusive: overlapping transfers cannot share a destination.
+        A framework free records its intent but does not return leased rows to
+        the allocator. Holding the tensor alone does not provide this guarantee.
+        """
+        if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "I/O lease indices must be a one-dimensional integer tensor"
+            )
+        selected = indices.detach().cpu().to(torch.int64).clone()
+        if not selected.numel() or selected.unique().numel() != selected.numel():
+            raise ValueError("I/O lease requires distinct nonempty host indices")
+        if selected.min().item() < 0 or selected.max().item() >= self.logical_size:
+            raise ValueError("I/O lease indices are outside the host pool")
+        if not self.slot_used[selected].all() or self._io_free_pending[selected].any():
+            raise RuntimeError("I/O lease requires allocated host slots")
+        if self._io_leased[selected].any():
+            raise RuntimeError("host slots already have an I/O lease")
+        self._io_lease_next += 1
+        token = self._io_lease_next
+        self._io_leases[token] = selected
+        self._io_leased[selected] = True
+        return token
+
+    @synchronized
+    def release_io_lease(self, token: int) -> None:
+        """Release only after the native transfer establishes quiescence."""
+        selected = self._io_leases.pop(token)
+        self._io_leased[selected] = False
+        deferred = selected[self._io_free_pending[selected]]
+        self._io_free_pending[deferred] = False
+        if deferred.numel():
+            self.slot_used[deferred] = False
+            self.release_slots.append(deferred)
+            self.num_release_slots += len(deferred)

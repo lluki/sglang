@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
 """Segmented KV pages in NIXLShard's local SSD and remote-owner cache.
 
-Native poll completion and release must quiesce I/O before returning. Python
-does not impose a second timeout that could release a late RDMA destination.
+Staged handles drain private buffers before returning. Direct receives lease
+host rows until native quiescence; a logical failure may return while uncertain
+DMA keeps those rows quarantined and unavailable for reuse.
 """
 
 import hashlib
@@ -26,6 +27,8 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 
 logger = logging.getLogger(__name__)
+_quarantine_owners = set()
+_quarantine_owner_lock = threading.Lock()
 
 
 @lru_cache(maxsize=1)
@@ -61,6 +64,20 @@ class HiCacheNixlShard(HiCacheStorage):
             )
         import nixlshard
 
+        self.direct_receive = config.get("direct_receive", False)
+        if not isinstance(self.direct_receive, bool):
+            raise ValueError("agent.direct_receive must be a boolean")
+        if self.direct_receive and not (
+            getattr(nixlshard, "direct_receive_supported", False) is True
+            or getattr(nixlshard.Agent, "direct_receive_supported", False) is True
+        ):
+            raise ValueError("direct_receive requires a capable native NIXLShard build")
+        if self.direct_receive and not hasattr(nixlshard.Agent, "is_quiescent"):
+            raise ValueError("direct_receive requires Agent.is_quiescent")
+        self._direct_limit = config.get("max_inflight", 64)
+        if not isinstance(self._direct_limit, int) or self._direct_limit <= 0:
+            raise ValueError("agent.max_inflight must be a positive integer")
+
         self.storage_config = storage_config
         self.model_revision = revision
         export_native_metrics = extra.get("export_native_metrics", False)
@@ -83,6 +100,9 @@ class HiCacheNixlShard(HiCacheStorage):
         self._closed = False
         self._close_error = None
         self._registrations = []
+        self._direct_live = 0
+        self._quarantined = {}
+        self._quarantine_thread = None
         self._host_buffer = None
         self._stats = Counter()
         self._metric_samples = {
@@ -111,6 +131,18 @@ class HiCacheNixlShard(HiCacheStorage):
                 "layer_first",
             ):
                 raise NotImplementedError(f"unsupported KV layout: {pool.layout}")
+            if self.direct_receive and pool.layout not in (
+                "page_first",
+                "page_first_direct",
+            ):
+                raise NotImplementedError(
+                    "direct_receive requires page_first or page_first_direct"
+                )
+            if self.direct_receive and not all(
+                callable(getattr(pool, name, None))
+                for name in ("acquire_io_lease", "release_io_lease")
+            ):
+                raise ValueError("direct_receive requires a host pool with I/O leases")
             kv = getattr(pool, "kv_buffer", None)
             if not isinstance(kv, torch.Tensor) or not kv.is_contiguous():
                 raise NotImplementedError(
@@ -168,16 +200,18 @@ class HiCacheNixlShard(HiCacheStorage):
             self._token = self.agent.register_memory(self._base, self._buffer_bytes)
             self._registrations.append(self._token)
             self._host_buffer = kv
-            # Native runtime packs ordered segments into bounded, preregistered
-            # aligned slots. Alignment/noncontiguity never requires pool.flatten()
-            # or an additional Python staging allocation per page/direction.
+            # The native runtime registers the complete host pool for direct
+            # receive. Ordered K/V descriptors then address their final rows;
+            # staged mode uses private aligned slots. Neither mode calls
+            # pool.flatten() or allocates Python bounce buffers per page.
             self.mem_pool_host = pool
             logger.info(
-                "HiCacheNixlShard native build=%s namespace=%s layout=%s bytes/page=%d",
+                "HiCacheNixlShard native build=%s namespace=%s layout=%s bytes/page=%d direct_receive=%s",
                 self.build_marker,
                 self.namespace,
                 pool.layout,
                 self._page_bytes,
+                self.direct_receive,
             )
 
     def _validate_ranges(self, ptrs, lengths):
@@ -196,6 +230,7 @@ class HiCacheNixlShard(HiCacheStorage):
                 raise RuntimeError("nixlshard is closed")
             if self.mem_pool_host is None:
                 raise RuntimeError("register_mem_pool_host must be called first")
+            self._start_quarantine_reaper()
             self._active += 1
         try:
             yield
@@ -251,7 +286,97 @@ class HiCacheNixlShard(HiCacheStorage):
             for i in range(0, len(ptrs), stride)
         ]
 
-    def _wait(self, handle, count, request_id=None):
+    def _acquire_direct_lease(self, indices):
+        with self._condition:
+            if self._direct_live >= self._direct_limit:
+                self._stats["direct_quarantine_busy"] += 1
+                return None
+            self._direct_live += 1
+        try:
+            return self.mem_pool_host.acquire_io_lease(indices)
+        except BaseException:
+            with self._condition:
+                self._direct_live -= 1
+            raise
+
+    def _release_direct_lease(self, lease):
+        self.mem_pool_host.release_io_lease(lease)
+        with self._condition:
+            self._direct_live -= 1
+            self._condition.notify_all()
+
+    def _finish_direct_handle(self, handle, lease):
+        native_released = False
+        try:
+            if self.agent.is_quiescent(handle):
+                self.agent.release(handle)
+                native_released = True
+                self._release_direct_lease(lease)
+                return True
+        except Exception:
+            # Native errors cannot establish DMA safety. Keep the rows leased.
+            logger.exception("NIXLShard direct receive cleanup remains quarantined")
+        with self._condition:
+            self._quarantined[handle] = (lease, native_released)
+            self._stats["direct_quarantines"] += 1
+            # A thread target cycle alone is collectible if startup fails.
+            # Root ownership before attempting any background cleanup.
+            with _quarantine_owner_lock:
+                _quarantine_owners.add(self)
+            self._start_quarantine_reaper()
+        return False
+
+    def _start_quarantine_reaper(self):
+        # Called with self._condition held. A later operation/close may retry
+        # failed startup; retention remains safe without a running thread.
+        if self._quarantine_thread is not None or not self._quarantined:
+            return
+        thread = threading.Thread(
+            target=self._drain_quarantines,
+            name="nixlshard-receive-quarantine",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception:
+            logger.exception(
+                "Failed to start NIXLShard quarantine reaper; pool retained"
+            )
+            return
+        self._quarantine_thread = thread
+
+    def _drain_quarantines(self):
+        # The bound method retains the backend, native Agent and full pool even
+        # after detach fails or callers drop their references. One bounded map
+        # and one reaper serve all uncertain receives; no thread per timeout.
+        while True:
+            with self._condition:
+                pending = list(self._quarantined.items())
+                if not pending:
+                    with _quarantine_owner_lock:
+                        _quarantine_owners.discard(self)
+                    self._quarantine_thread = None
+                    self._condition.notify_all()
+                    return
+            for handle, (lease, native_released) in pending:
+                try:
+                    if not native_released:
+                        if not self.agent.is_quiescent(handle):
+                            continue
+                        self.agent.release(handle)
+                        with self._condition:
+                            self._quarantined[handle] = (lease, True)
+                    self._release_direct_lease(lease)
+                except Exception:
+                    continue  # Fail closed; this handle still owns its rows.
+                with self._condition:
+                    del self._quarantined[handle]
+                    self._stats["direct_quarantines_released"] += 1
+                    self._condition.notify_all()
+            with self._condition:
+                self._condition.wait(timeout=0.01)
+
+    def _wait(self, handle, count, request_id=None, lease=None):
         terminal_observed = False
         try:
             while True:
@@ -264,7 +389,7 @@ class HiCacheNixlShard(HiCacheStorage):
                         )
                     with self._condition:
                         self._stats.update(statuses)
-                    return [status == "success" for status in statuses]
+                    break
                 # Native progress does not depend on Python's GIL. Sleeping here
                 # allows the other storage worker and controller to run.
                 time.sleep(0.0005)
@@ -287,8 +412,15 @@ class HiCacheNixlShard(HiCacheStorage):
                         batch_handle=handle,
                         error_type=type(error).__name__,
                     )
-            # Also drains on an exceptional poll; registered buffers remain owned.
-            self.agent.release(handle)
+            if lease is None:
+                # Staged receives drain private scratch, never caller rows.
+                self.agent.release(handle)
+                publish_safe = True
+            else:
+                publish_safe = self._finish_direct_handle(handle, lease)
+        # An unsafe success is not published to the cache/H2D path. Its rows
+        # remain quarantined just like a logical timeout or transport failure.
+        return [publish_safe and status == "success" for status in statuses]
 
     def _transfer(self, keys, host_indices, direction, extra_info):
         if not keys:
@@ -321,7 +453,21 @@ class HiCacheNixlShard(HiCacheStorage):
                     if direction == "get"
                     else self.agent.batch_store
                 )
-                completed = self._wait(submit(items), len(batch), request_id)
+                lease = None
+                if self.direct_receive and direction == "get":
+                    begin = first * self.mem_pool_host.page_size
+                    end = begin + len(batch) * self.mem_pool_host.page_size
+                    lease = self._acquire_direct_lease(host_indices[begin:end])
+                    if lease is None:
+                        results.extend([False] * len(batch))
+                        continue
+                try:
+                    handle = submit(items)
+                except BaseException:
+                    if lease is not None:
+                        self._release_direct_lease(lease)
+                    raise
+                completed = self._wait(handle, len(batch), request_id, lease)
                 results.extend(completed)
             with self._condition:
                 self._stats[f"{direction}_pages"] += len(results)
@@ -465,9 +611,17 @@ class HiCacheNixlShard(HiCacheStorage):
                         "nixlshard shutdown failed"
                     ) from self._close_error
                 return
+            self._close_error = None
             self._closing = True
             self._condition.notify_all()
             self._condition.wait_for(lambda: self._active == 0)
+            if self._quarantined:
+                self._start_quarantine_reaper()
+                error = RuntimeError("nixlshard has pending direct receive quarantines")
+                self._close_error = error
+                self._closing = False
+                self._condition.notify_all()
+                raise error
         # Native close drains all I/O before deregistration. Retain tensor owners
         # through this call; active adapter operations have already released handles.
         try:

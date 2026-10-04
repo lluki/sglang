@@ -108,6 +108,7 @@ class FakeAgent:
 class Pool:
     # Exercise the real framework allocation/lease methods on a tiny CPU pool.
     clear = HostKVCache.clear
+    destroy = HostKVCache.destroy
     alloc = HostKVCache.alloc
     free = HostKVCache.free
     available_size = HostKVCache.available_size
@@ -410,6 +411,35 @@ class TestHiCacheNixlShard(unittest.TestCase):
         pool.clear()  # Reset allowed only after all external DMA is quiescent.
         with self.assertRaisesRegex(RuntimeError, "allocated"):
             pool.acquire_io_lease(torch.arange(2))
+
+    def test_host_destroy_rejects_dma_lease_before_unpin_or_buffer_mutation(self):
+        from sglang.srt.mem_cache.pool_host import base
+
+        pool = Pool()
+        pool.pin_memory = True
+        original = pool.kv_buffer
+        lease = pool.acquire_io_lease(torch.arange(2))
+        with patch.object(base, "_is_cuda", True), patch.object(
+            base, "_cuda_host_unregister"
+        ) as unregister:
+            with self.assertRaisesRegex(RuntimeError, "I/O leases"):
+                pool.destroy()
+            self.assertIs(pool.kv_buffer, original)
+            self.assertFalse(getattr(pool, "_destroyed", False))
+            unregister.assert_not_called()
+            pool.release_io_lease(lease)
+            pool.destroy()
+            unregister.assert_called_once_with(original)
+            self.assertIsNone(pool.kv_buffer)
+            self.assertTrue(pool._destroyed)
+            pool.destroy()
+            unregister.assert_called_once()
+            with self.assertRaisesRegex(RuntimeError, "destroyed"):
+                pool.acquire_io_lease(torch.arange(2))
+        partial = Pool.__new__(Pool)
+        partial.destroy()
+        self.assertTrue(partial._destroyed)
+        self.assertIsNone(partial.kv_buffer)
 
     def test_detach_preserves_direct_backend_and_groups_until_quiescent_close(self):
         from sglang.srt.managers.cache_controller import HiCacheController

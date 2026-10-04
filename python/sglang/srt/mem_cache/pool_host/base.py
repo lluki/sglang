@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from contextlib import nullcontext
 from functools import wraps
 from typing import Optional
 
@@ -217,17 +218,23 @@ class HostKVCache(abc.ABC):
         sleep for tens of seconds. Idempotent. (Only the host_register path
         needs this; npu/musa pin_memory buffers are freed by torch.)
         """
-        if getattr(self, "_destroyed", False):
-            return
-        self._destroyed = True
-        buffers = getattr(self, "kv_buffer", None)
-        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
-            if not isinstance(buffers, (list, tuple)):
-                buffers = [buffers]
-            for buf in buffers:
-                if buf is not None:
-                    _cuda_host_unregister(buf)
-        self.kv_buffer = None
+        # Initialization may fail before creating the allocator lock. Such an
+        # object cannot have leases, but its partially allocated buffer still
+        # needs the existing best-effort destroy behavior.
+        with getattr(self, "lock", nullcontext()):
+            if getattr(self, "_io_leases", None):
+                raise RuntimeError("cannot destroy a host pool with active I/O leases")
+            if getattr(self, "_destroyed", False):
+                return
+            self._destroyed = True
+            buffers = getattr(self, "kv_buffer", None)
+            if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
+                if not isinstance(buffers, (list, tuple)):
+                    buffers = [buffers]
+                for buf in buffers:
+                    if buf is not None:
+                        _cuda_host_unregister(buf)
+            self.kv_buffer = None
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -434,6 +441,8 @@ class HostKVCache(abc.ABC):
         A framework free records its intent but does not return leased rows to
         the allocator. Holding the tensor alone does not provide this guarantee.
         """
+        if getattr(self, "_destroyed", False):
+            raise RuntimeError("cannot lease a destroyed host pool")
         if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
             raise ValueError(
                 "I/O lease indices must be a one-dimensional integer tensor"

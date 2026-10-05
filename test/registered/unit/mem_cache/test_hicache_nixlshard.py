@@ -4,6 +4,7 @@
 
 import ctypes
 import gc
+import hashlib
 import sys
 import threading
 import types
@@ -25,7 +26,10 @@ from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 
 
 class FakeAgent:
+    authoritative_g3_supported = True
+
     def __init__(self, config):
+        self.config = config
         self.regions = {}
         self.values = {}
         self.submissions = []
@@ -97,8 +101,9 @@ class FakeAgent:
         assert self.is_quiescent(handle)
         self.released.append(handle)
 
-    def batch_exists(self, keys, hints=None):
+    def batch_exists(self, keys, hints=None, g3_instance=""):
         self.last_hints = hints
+        self.last_g3_instance = g3_instance
         return [key in self.values for key in keys]
 
     def close(self):
@@ -153,6 +158,10 @@ class Pool:
         return pointers, lengths
 
 
+def page_keys(*labels):
+    return [hashlib.sha256(label.encode()).hexdigest() for label in labels]
+
+
 def config(
     revision="abc123",
     direct_io=False,
@@ -174,7 +183,11 @@ def config(
         model_name="Qwen/Qwen3-32B-FP8",
         extra_config={
             "model_revision": revision,
-            "agent": {"direct_io": direct_io, "direct_receive": direct_receive},
+            "agent": {
+                "direct_io": direct_io,
+                "direct_receive": direct_receive,
+                "numa_node": 0,
+            },
             "export_native_metrics": export_native_metrics,
         },
     )
@@ -213,7 +226,8 @@ class TestHiCacheNixlShard(unittest.TestCase):
                 expected = pool.kv_buffer.clone()
                 indices = torch.arange(8)
                 self.assertEqual(
-                    backend.batch_set_v1(["a", "b", "c", "d"], indices), [True] * 4
+                    backend.batch_set_v1(page_keys("a", "b", "c", "d"), indices),
+                    [True] * 4,
                 )
                 items = backend.agent.submissions[0][1]
                 self.assertEqual(len(items), 4)
@@ -222,7 +236,8 @@ class TestHiCacheNixlShard(unittest.TestCase):
                 )
                 pool.kv_buffer.zero_()
                 self.assertEqual(
-                    backend.batch_get_v1(["a", "b", "c", "d"], indices), [True] * 4
+                    backend.batch_get_v1(page_keys("a", "b", "c", "d"), indices),
+                    [True] * 4,
                 )
                 torch.testing.assert_close(pool.kv_buffer, expected)
                 self.assertEqual(len(backend.agent.regions), 1)
@@ -245,9 +260,9 @@ class TestHiCacheNixlShard(unittest.TestCase):
                 self.assertEqual(direct.namespace, staged.namespace)
                 expected = pool.kv_buffer[:, 2:4].clone()
                 indices = torch.tensor([2, 3])
-                self.assertEqual(direct.batch_set_v1(["a"], indices), [True])
+                self.assertEqual(direct.batch_set_v1(page_keys("a"), indices), [True])
                 pool.kv_buffer[:, 2:4].zero_()
-                self.assertEqual(direct.batch_get_v1(["a"], indices), [True])
+                self.assertEqual(direct.batch_get_v1(page_keys("a"), indices), [True])
                 torch.testing.assert_close(pool.kv_buffer[:, 2:4], expected)
                 token, capacity = next(iter(direct.agent.regions.items()))
                 self.assertEqual(
@@ -271,7 +286,7 @@ class TestHiCacheNixlShard(unittest.TestCase):
                 self.backends.append(backend)
                 with self.assertRaisesRegex(NotImplementedError, "direct_receive"):
                     backend.register_mem_pool_host(Pool(layout))
-                self.assertEqual(backend.agent.regions, {})
+                self.assertIsNone(backend.agent)
 
     def test_failed_direct_receive_defers_free_until_late_dma_quiescence(self):
         sys.modules["nixlshard"].direct_receive_supported = True
@@ -283,20 +298,23 @@ class TestHiCacheNixlShard(unittest.TestCase):
         with patch.object(
             backend.agent,
             "poll",
-            side_effect=lambda h: ["timeout"] if h == 0 else original_poll(h),
+            side_effect=lambda h: page_keys("timeout") if h == 0 else original_poll(h),
         ):
-            self.assertEqual(backend.batch_get_v1(["late"], torch.arange(2)), [False])
+            self.assertEqual(
+                backend.batch_get_v1(page_keys("late"), torch.arange(2)), [False]
+            )
             pool.free(torch.arange(2))  # Controller completed_req/abort tail release.
             self.assertEqual(pool.available_size(), 0)
             self.assertTrue(pool.slot_used[:2].all())
             with self.assertRaisesRegex(RuntimeError, "I/O leases"):
                 pool.clear()
             with self.assertRaisesRegex(RuntimeError, "I/O lease"):
-                backend.batch_get_v1(["overlap"], torch.arange(2))
+                backend.batch_get_v1(page_keys("overlap"), torch.arange(2))
             # Healthy unrelated destinations still complete while the failed
             # remote connection may write the quarantined rows at any time.
             self.assertEqual(
-                backend.batch_get_v1(["healthy-miss"], torch.arange(2, 4)), [False]
+                backend.batch_get_v1(page_keys("healthy-miss"), torch.arange(2, 4)),
+                [False],
             )
             self.assertEqual(backend.agent.released, [1])
             with self.assertRaisesRegex(RuntimeError, "quarantines"):
@@ -329,13 +347,15 @@ class TestHiCacheNixlShard(unittest.TestCase):
         unsafe = threading.Event()
         backend.agent.quiescence[0] = unsafe
         with patch.object(
-            backend.agent, "poll", return_value=["timeout"]
+            backend.agent, "poll", return_value=page_keys("timeout")
         ), patch.object(
             threading.Thread, "start", side_effect=RuntimeError("no thread resources")
         ), self.assertLogs(
             "sglang.srt.mem_cache.storage.nixlshard.hicache_nixlshard", level="ERROR"
         ):
-            self.assertEqual(backend.batch_get_v1(["late"], torch.arange(2)), [False])
+            self.assertEqual(
+                backend.batch_get_v1(page_keys("late"), torch.arange(2)), [False]
+            )
         self.assertIsNone(backend._quarantine_thread)
         pool.free(torch.arange(2))
         reference, tensor = weakref.ref(backend), weakref.ref(pool.kv_buffer)
@@ -375,10 +395,11 @@ class TestHiCacheNixlShard(unittest.TestCase):
         try:
             with patch.object(backend.agent, "poll", return_value=["success"]):
                 self.assertEqual(
-                    backend.batch_get_v1(["unsafe"], torch.arange(2)), [False]
+                    backend.batch_get_v1(page_keys("unsafe"), torch.arange(2)), [False]
                 )
                 self.assertEqual(
-                    backend.batch_get_v1(["bounded"], torch.arange(2, 4)), [False]
+                    backend.batch_get_v1(page_keys("bounded"), torch.arange(2, 4)),
+                    [False],
                 )
             self.assertEqual(len(backend.agent.submissions), 1)
             self.assertEqual(backend._direct_live, 1)
@@ -465,15 +486,17 @@ class TestHiCacheNixlShard(unittest.TestCase):
     def test_prefix_exists_and_miss_after_exists(self):
         backend = self.backend()
         self.assertEqual(
-            backend.batch_set_v1(["a", "c"], torch.tensor([0, 1, 4, 5])), [True, True]
+            backend.batch_set_v1(page_keys("a", "c"), torch.tensor([0, 1, 4, 5])),
+            [True, True],
         )
         hints = HiCacheStorageExtraInfo(extra_info={"owner_hints": ["owner"] * 3})
-        self.assertEqual(backend.batch_exists(["a", "b", "c"], hints), 1)
+        self.assertEqual(backend.batch_exists(page_keys("a", "b", "c"), hints), 1)
         self.assertEqual(backend.agent.last_hints, ["owner"] * 3)
-        self.assertTrue(backend.exists("a"))
-        del backend.agent.values[backend._keys(["a"])[0]]
+        self.assertTrue(backend.exists(page_keys("a")[0]))
+        del backend.agent.values[backend._keys(page_keys("a"))[0]]
         self.assertEqual(
-            backend.batch_get_v1(["a", "b", "c"], torch.arange(6)), [False, False, True]
+            backend.batch_get_v1(page_keys("a", "b", "c"), torch.arange(6)),
+            [False, False, True],
         )
 
     def test_page_validation_before_io(self):
@@ -487,7 +510,7 @@ class TestHiCacheNixlShard(unittest.TestCase):
         ):
             with self.subTest(indices=indices):
                 with self.assertRaises(ValueError):
-                    backend.batch_set_v1(["a"], indices)
+                    backend.batch_set_v1(page_keys("a"), indices)
         self.assertEqual(backend.agent.submissions, [])
         self.assertEqual(
             backend.batch_get_v1([], torch.empty(0, dtype=torch.int64)), []
@@ -501,19 +524,150 @@ class TestHiCacheNixlShard(unittest.TestCase):
         backend = self.backend(pool, direct_io=True)
         expected = pool.kv_buffer.clone()
         self.assertEqual(
-            backend.batch_set_v1(["a", "b"], torch.arange(4)), [True, True]
+            backend.batch_set_v1(page_keys("a", "b"), torch.arange(4)), [True, True]
         )
         self.assertTrue(
             all(len(v) == backend._page_bytes for v in backend.agent.values.values())
         )
-        backend.agent.fail_keys.add(backend._keys(["b"])[0])
+        backend.agent.fail_keys.add(backend._keys(page_keys("b"))[0])
         pool.kv_buffer.zero_()
         self.assertEqual(
-            backend.batch_get_v1(["a", "b"], torch.arange(4)), [True, False]
+            backend.batch_get_v1(page_keys("a", "b"), torch.arange(4)), [True, False]
         )
         torch.testing.assert_close(pool.kv_buffer[:, :, :2], expected[:, :, :2])
         self.assertEqual(pool.kv_buffer[:, :, 2:4].count_nonzero().item(), 0)
         self.assertEqual(backend.get_stats()["get_hits"], 1)
+
+    def test_schema_and_geometry_are_bound_before_ssd_open(self):
+        storage_config = config()
+        disk = {"path": "/disposable/mock", "create": True, "unit_bytes": 65536}
+        storage_config.extra_config["agent"].update(
+            disks=[disk], numa_node=3, g3_instance="model-kv"
+        )
+        original = dict(disk)
+        backend = StorageBackendFactory.create_backend(
+            "nixlshard", storage_config, Pool()
+        )
+        self.backends.append(backend)
+        self.assertIsNone(backend.agent)
+        pool = Pool()
+        backend.register_mem_pool_host(pool)
+        self.assertEqual(disk, original)
+        native = backend.agent.config
+        self.assertEqual(native["namespace_id"], backend.namespace_identity)
+        self.assertEqual(native["registration_mode"], "EXPLICIT")
+        self.assertEqual(native["g3_instance"], "model-kv")
+        self.assertEqual(native["numa_node"], 3)
+        self.assertEqual(native["disks"][0]["namespace_id"], backend.namespace_identity)
+        self.assertEqual(native["disks"][0]["numa_node"], 3)
+        self.assertEqual(native["disks"][0]["key_bytes"], 32)
+        self.assertEqual(native["disks"][0]["min_object_bytes"], backend._page_bytes)
+        self.assertEqual(native["disks"][0]["max_object_bytes"], backend._page_bytes)
+        self.assertEqual(native["disks"][0]["unit_bytes"], 4096)
+        self.assertEqual(native["disks"][0]["metadata_alignment"], 4096)
+        backend.register_mem_pool_host(pool)
+        self.assertEqual(len(backend.agent.regions), 1)
+
+    def test_full_binary_digest_and_affinity_survive_both_transfer_modes(self):
+        digest = bytes(range(32))
+        for direct in (False, True):
+            with self.subTest(direct=direct):
+                native = types.SimpleNamespace(
+                    Agent=FakeAgent, direct_receive_supported=True
+                )
+                with patch.dict(sys.modules, {"nixlshard": native}):
+                    storage_config = config(direct_receive=direct)
+                    storage_config.extra_config["agent"].update(
+                        numa_node=5, g3_instance="assigned-nvme"
+                    )
+                    backend = StorageBackendFactory.create_backend(
+                        "nixlshard", storage_config, Pool()
+                    )
+                self.backends.append(backend)
+                backend.register_mem_pool_host(Pool())
+                self.assertEqual(
+                    backend.batch_set_v1([digest.hex()], torch.arange(2)), [True]
+                )
+                self.assertEqual(
+                    backend.batch_get_v1([digest.hex()], torch.arange(2)), [True]
+                )
+                for _, items in backend.agent.submissions:
+                    self.assertEqual(items[0]["key"], digest)
+                    self.assertEqual(items[0]["g3_instance"], "assigned-nvme")
+                    self.assertEqual(items[0]["numa"], 5)
+                self.assertEqual(backend.batch_exists([digest.hex()]), 1)
+                self.assertEqual(backend.agent.last_g3_instance, "assigned-nvme")
+
+    def test_invalid_or_short_keys_fail_before_transfer(self):
+        backend = self.backend()
+        for key in ("short", "0" * 62, "0" * 66, "g" * 64, b"a" * 32, "\u00e9" * 64):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    backend.batch_set_v1([key], torch.arange(2))
+                with self.assertRaises(ValueError):
+                    backend.batch_exists([key])
+        self.assertEqual(backend.agent.submissions, [])
+
+    def test_readable_namespace_digest_is_not_exact_identity(self):
+        with patch(
+            "sglang.srt.mem_cache.storage.nixlshard.hicache_nixlshard.hashlib.sha256"
+        ) as digest:
+            digest.return_value.hexdigest.return_value = "same-readable-id"
+            left = self.backend(revision="revision-left")
+            right = self.backend(revision="revision-right")
+        self.assertEqual(left.namespace, right.namespace)
+        self.assertNotEqual(left.namespace_identity, right.namespace_identity)
+        self.assertNotEqual(
+            left.agent.config["namespace_id"], right.agent.config["namespace_id"]
+        )
+
+    def test_bad_instance_affinity_and_old_native_are_rejected(self):
+        for field, value in (
+            ("numa_node", None),
+            ("numa_node", -1),
+            ("numa_node", True),
+            ("g3_instance", ""),
+            ("registration_mode", "AUTOMATIC"),
+        ):
+            with self.subTest(field=field, value=value):
+                storage_config = config()
+                storage_config.extra_config["agent"][field] = value
+                with self.assertRaises(ValueError):
+                    StorageBackendFactory.create_backend(
+                        "nixlshard", storage_config, Pool()
+                    )
+        old_agent = type("OldAgent", (), {"__init__": Mock()})
+        with patch.dict(
+            sys.modules, {"nixlshard": types.SimpleNamespace(Agent=old_agent)}
+        ):
+            with self.assertRaisesRegex(ValueError, "authoritative-G3"):
+                StorageBackendFactory.create_backend("nixlshard", config(), Pool())
+        old_agent.__init__.assert_not_called()
+
+    def test_mismatched_disk_identity_fails_before_agent_open(self):
+        for mismatch in (
+            {"namespace_id": "different-full-schema"},
+            {"numa_node": 1},
+            {"key_bytes": 16},
+        ):
+            with self.subTest(mismatch=mismatch):
+                storage_config = config()
+                storage_config.extra_config["agent"]["disks"] = [mismatch]
+                backend = StorageBackendFactory.create_backend(
+                    "nixlshard", storage_config, Pool()
+                )
+                self.backends.append(backend)
+                with self.assertRaises(ValueError):
+                    backend.register_mem_pool_host(Pool())
+                self.assertIsNone(backend.agent)
+
+    def test_unregistered_backend_can_close_without_opening_disks(self):
+        backend = StorageBackendFactory.create_backend("nixlshard", config(), Pool())
+        self.backends.append(backend)
+        backend.close()
+        self.assertIsNone(backend.agent)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            backend.register_mem_pool_host(Pool())
 
     def test_namespaces_separate_revision_layout_dtype_rank(self):
         base = self.backend()
@@ -525,6 +679,7 @@ class TestHiCacheNixlShard(unittest.TestCase):
         ]
         self.assertEqual(len({base.namespace, *(b.namespace for b in others)}), 5)
         self.assertEqual(self.backend().namespace, base.namespace)
+        self.assertEqual(self.backend().namespace_identity, base.namespace_identity)
         with self.assertRaises(ValueError):
             StorageBackendFactory.create_backend(
                 "nixlshard", config(revision=""), Pool()
@@ -532,16 +687,18 @@ class TestHiCacheNixlShard(unittest.TestCase):
 
     def test_auxiliary_pools_cannot_silently_hit(self):
         backend = self.backend()
-        auxiliary = [PoolTransfer(PoolName.MAMBA, keys=["a"])]
+        auxiliary = [PoolTransfer(PoolName.MAMBA, keys=page_keys("a"))]
         with self.assertRaises(NotImplementedError):
-            backend.batch_exists_v2(["a"], auxiliary)
+            backend.batch_exists_v2(page_keys("a"), auxiliary)
         with self.assertRaises(NotImplementedError):
             backend.batch_get_v2(auxiliary)
         with self.assertRaises(NotImplementedError):
             backend.register_mem_host_pool_v2(Pool(), PoolName.MAMBA)
-        transfer = PoolTransfer(PoolName.KV, host_indices=torch.arange(2), keys=["a"])
+        transfer = PoolTransfer(
+            PoolName.KV, host_indices=torch.arange(2), keys=page_keys("a")
+        )
         self.assertEqual(backend.batch_set_v2([transfer]), {PoolName.KV: [True]})
-        self.assertEqual(backend.batch_exists_v2(["a"]).kv_hit_pages, 1)
+        self.assertEqual(backend.batch_exists_v2(page_keys("a")).kv_hit_pages, 1)
 
     def test_exceptional_poll_drains_handle_before_releasing_active_operation(self):
         backend = self.backend()
@@ -549,7 +706,7 @@ class TestHiCacheNixlShard(unittest.TestCase):
             backend.agent, "poll", side_effect=RuntimeError("poll failed")
         ):
             with self.assertRaisesRegex(RuntimeError, "poll failed"):
-                backend.batch_get_v1(["a"], torch.arange(2))
+                backend.batch_get_v1(page_keys("a"), torch.arange(2))
         self.assertEqual(backend.agent.released, [0])
         self.assertEqual(backend._active, 0)
 
@@ -566,7 +723,7 @@ class TestHiCacheNixlShard(unittest.TestCase):
 
     def test_native_counters_preserve_adapter_page_counts(self):
         backend = self.backend()
-        backend.batch_set_v1(["a"], torch.arange(2))
+        backend.batch_set_v1(page_keys("a"), torch.arange(2))
         with patch.object(
             backend.agent,
             "stats",
@@ -685,8 +842,8 @@ class TestHiCacheNixlShard(unittest.TestCase):
         )
 
         backend = self.backend()
-        backend.batch_set_v1(["a"], torch.arange(2))
-        backend.batch_get_v1(["a"], torch.arange(2))
+        backend.batch_set_v1(page_keys("a"), torch.arange(2))
+        backend.batch_get_v1(page_keys("a"), torch.arange(2))
         snapshot = backend.get_stats()
         self.assertIsInstance(snapshot, StorageMetrics)
         self.assertEqual(snapshot.backup_pgs, [1])
@@ -729,22 +886,29 @@ class TestHiCacheNixlShard(unittest.TestCase):
             controller.page_get_func.__func__, HiCacheController._page_get_zero_copy
         )
         self.assertTrue(
-            controller.page_set_func(["a", "c"], torch.tensor([0, 1, 4, 5]))
+            controller.page_set_func(page_keys("a", "c"), torch.tensor([0, 1, 4, 5]))
         )
         operation = types.SimpleNamespace(request_id="contract-test")
         self.assertEqual(
-            controller.page_get_func(operation, ["a", "b", "c"], torch.arange(6)), 1
+            controller.page_get_func(
+                operation, page_keys("a", "b", "c"), torch.arange(6)
+            ),
+            1,
         )
-        backend.agent.fail_keys.add(backend._keys(["b"])[0])
-        self.assertFalse(controller.page_set_func(["a", "b"], torch.arange(4)))
+        backend.agent.fail_keys.add(backend._keys(page_keys("b"))[0])
+        self.assertFalse(controller.page_set_func(page_keys("a", "b"), torch.arange(4)))
 
     def test_concurrent_backup_prefetch_keep_independent_page_descriptors(self):
         backend = self.backend(direct_io=True)
-        backend.batch_set_v1(["old"], torch.arange(2))
+        backend.batch_set_v1(page_keys("old"), torch.arange(2))
         backend.agent.poll_barrier = threading.Barrier(2)
         with ThreadPoolExecutor(2) as workers:
-            get = workers.submit(backend.batch_get_v1, ["old"], torch.arange(2, 4))
-            put = workers.submit(backend.batch_set_v1, ["new"], torch.arange(4, 6))
+            get = workers.submit(
+                backend.batch_get_v1, page_keys("old"), torch.arange(2, 4)
+            )
+            put = workers.submit(
+                backend.batch_set_v1, page_keys("new"), torch.arange(4, 6)
+            )
             self.assertEqual(get.result(timeout=4), [True])
             self.assertEqual(put.result(timeout=4), [True])
         get_items = next(
@@ -766,7 +930,9 @@ class TestHiCacheNixlShard(unittest.TestCase):
         backend = self.backend()
         backend.agent.ready = threading.Event()
         with ThreadPoolExecutor(2) as workers:
-            transfer = workers.submit(backend.batch_set_v1, ["a"], torch.arange(2))
+            transfer = workers.submit(
+                backend.batch_set_v1, page_keys("a"), torch.arange(2)
+            )
             self.assertTrue(backend.agent.started.wait(2))
             closing = workers.submit(backend.close)
             with backend._condition:

@@ -7,6 +7,8 @@ host rows until native quiescence; a logical failure may return while uncertain
 DMA keeps those rows quarantined and unavailable for reuse.
 """
 
+import binascii
+import copy
 import hashlib
 import json
 import logging
@@ -64,6 +66,27 @@ class HiCacheNixlShard(HiCacheStorage):
             )
         import nixlshard
 
+        if not (
+            getattr(nixlshard, "authoritative_g3_supported", False) is True
+            or getattr(nixlshard.Agent, "authoritative_g3_supported", False) is True
+        ):
+            raise ValueError("nixlshard requires an authoritative-G3 native build")
+        self.numa_node = config.get("numa_node")
+        if type(self.numa_node) is not int or self.numa_node < 0:
+            raise ValueError("agent.numa_node must be an explicit nonnegative integer")
+        self.g3_instance = config.get("g3_instance", "local")
+        if not isinstance(self.g3_instance, str) or not self.g3_instance:
+            raise ValueError("agent.g3_instance must be a nonempty string")
+        if config.get("registration_mode", "EXPLICIT") != "EXPLICIT":
+            raise ValueError("the SGLang adapter requires EXPLICIT registration_mode")
+        if "g3_instances" in config:
+            raise NotImplementedError(
+                "the MHA adapter uses single-instance agent fields"
+            )
+        self._agent_type = nixlshard.Agent
+        self._agent_config = copy.deepcopy(config)
+        self._agent_config["g3_instance"] = self.g3_instance
+        self._agent_config["registration_mode"] = "EXPLICIT"
         self.direct_receive = config.get("direct_receive", False)
         if not isinstance(self.direct_receive, bool):
             raise ValueError("agent.direct_receive must be a boolean")
@@ -92,7 +115,9 @@ class HiCacheNixlShard(HiCacheStorage):
         )
         if self._trace_requests and not hasattr(nixlshard.Agent, "trace"):
             raise ValueError("request tracing requires a native build with Agent.trace")
-        self.agent = nixlshard.Agent(dict(config))
+        # The exact model/layout identity and geometry must precede SSD open.
+        # They become available only when the concrete host pool is registered.
+        self.agent = None
         self.build_marker = getattr(nixlshard, "__build_marker__", "unknown")
         self._condition = threading.Condition()
         self._active = 0
@@ -194,10 +219,24 @@ class HiCacheNixlShard(HiCacheStorage):
                     )
                 },
             }
+            self.namespace_identity = json.dumps(
+                schema, sort_keys=True, separators=(",", ":")
+            )
+            # This digest is a diagnostic ID only. The complete canonical schema
+            # binds the G3 instance and is validated in its persisted header.
             self.namespace = hashlib.sha256(
-                json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
+                self.namespace_identity.encode()
             ).hexdigest()
-            self._token = self.agent.register_memory(self._base, self._buffer_bytes)
+            native_config = self._config_for_pool()
+            agent = self._agent_type(native_config)
+            try:
+                token = agent.register_memory(self._base, self._buffer_bytes)
+            except BaseException:
+                agent.close()
+                raise
+            self.agent = agent
+            self.native_config = native_config
+            self._token = token
             self._registrations.append(self._token)
             self._host_buffer = kv
             # The native runtime registers the complete host pool for direct
@@ -206,13 +245,48 @@ class HiCacheNixlShard(HiCacheStorage):
             # pool.flatten() or allocates Python bounce buffers per page.
             self.mem_pool_host = pool
             logger.info(
-                "HiCacheNixlShard native build=%s namespace=%s layout=%s bytes/page=%d direct_receive=%s",
+                "HiCacheNixlShard native build=%s namespace=%s layout=%s bytes/page=%d direct_receive=%s g3_instance=%s numa=%d",
                 self.build_marker,
                 self.namespace,
                 pool.layout,
                 self._page_bytes,
                 self.direct_receive,
+                self.g3_instance,
+                self.numa_node,
             )
+
+    def _config_for_pool(self):
+        config = copy.deepcopy(self._agent_config)
+        if (
+            config.get("namespace_id", self.namespace_identity)
+            != self.namespace_identity
+        ):
+            raise ValueError(
+                "agent.namespace_id must match the exact canonical pool schema"
+            )
+        config["namespace_id"] = self.namespace_identity
+        for disk in config.get("disks", []):
+            if (
+                disk.get("namespace_id", self.namespace_identity)
+                != self.namespace_identity
+            ):
+                raise ValueError("disk namespace_id differs from the exact pool schema")
+            if disk.get("numa_node", self.numa_node) != self.numa_node:
+                raise ValueError(
+                    "assigned disk NUMA node differs from the intended pool affinity"
+                )
+            if disk.get("key_bytes", 32) != 32:
+                raise ValueError("SGLang G3 disks require 32-byte full page digests")
+            disk.update(
+                namespace_id=self.namespace_identity,
+                numa_node=self.numa_node,
+                key_bytes=32,
+                min_object_bytes=self._page_bytes,
+                max_object_bytes=self._page_bytes,
+                unit_bytes=((self._page_bytes + 4095) // 4096) * 4096,
+            )
+            disk.setdefault("metadata_alignment", 4096)
+        return config
 
     def _validate_ranges(self, ptrs, lengths):
         for ptr, length in zip(ptrs, lengths):
@@ -240,9 +314,19 @@ class HiCacheNixlShard(HiCacheStorage):
                 self._condition.notify_all()
 
     def _keys(self, keys):
-        if any(not isinstance(key, str) or not key for key in keys):
-            raise ValueError("cache keys must be nonempty strings")
-        return [f"{self.namespace}:{key}" for key in keys]
+        result = []
+        for key in keys:
+            if not isinstance(key, str) or len(key) != 64:
+                raise ValueError(
+                    "HiCache keys must be complete SHA256 hexadecimal digests"
+                )
+            try:
+                result.append(binascii.unhexlify(key))
+            except (ValueError, binascii.Error) as error:
+                raise ValueError(
+                    "HiCache keys must be complete SHA256 hexadecimal digests"
+                ) from error
+        return result
 
     @staticmethod
     def _hints(extra_info, count):
@@ -429,7 +513,7 @@ class HiCacheNixlShard(HiCacheStorage):
             return []
         with self._operation():
             start = time.perf_counter()
-            namespaced = self._keys(keys)
+            native_keys = self._keys(keys)
             pages = self._page_segments(keys, host_indices)
             hints = self._hints(extra_info, len(keys))
             request_id = (
@@ -444,7 +528,12 @@ class HiCacheNixlShard(HiCacheStorage):
                         (self._token, ptr - self._base, length)
                         for ptr, length in segments
                     ]
-                    item = {"key": namespaced[first + i], "segments": descriptors}
+                    item = {
+                        "key": native_keys[first + i],
+                        "segments": descriptors,
+                        "g3_instance": self.g3_instance,
+                        "numa": self.numa_node,
+                    }
                     if hints is not None and direction == "get":
                         item["hint"] = hints[first + i]
                     items.append(item)
@@ -508,7 +597,9 @@ class HiCacheNixlShard(HiCacheStorage):
             )
             try:
                 found = self.agent.batch_exists(
-                    self._keys(keys), self._hints(extra_info, len(keys))
+                    self._keys(keys),
+                    self._hints(extra_info, len(keys)),
+                    g3_instance=self.g3_instance,
                 )
             finally:
                 if start_ns is not None:
@@ -625,7 +716,8 @@ class HiCacheNixlShard(HiCacheStorage):
         # Native close drains all I/O before deregistration. Retain tensor owners
         # through this call; active adapter operations have already released handles.
         try:
-            self.agent.close()
+            if self.agent is not None:
+                self.agent.close()
         except BaseException as error:
             with self._condition:
                 # Preserve registrations and tensor ownership if native shutdown

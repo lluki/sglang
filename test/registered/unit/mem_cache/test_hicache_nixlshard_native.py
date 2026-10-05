@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from test_hicache_nixlshard import Pool, config
+from test_hicache_nixlshard import Pool, config, page_keys
 
 from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
@@ -29,8 +29,8 @@ from sglang.srt.observability import request_timeline
     "requires the rebuilt native NIXLShard runtime",
 )
 class TestNativeHiCacheNixlShard(unittest.TestCase):
-    def backend(self, pool, directory, direct_io, **overrides):
-        storage_config = config(direct_io=direct_io)
+    def backend(self, pool, directory, direct_io, revision="abc123", **overrides):
+        storage_config = config(revision=revision, direct_io=direct_io)
         storage_config.extra_config["agent"] = {
             "name": "hicache-test-" + uuid.uuid4().hex,
             "disks": [
@@ -50,6 +50,7 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
             "staging_slots": 4,
             "workers": 2,
             "direct_io": direct_io,
+            "numa_node": 0,
         }
         storage_config.extra_config["agent"].update(overrides)
         backend = StorageBackendFactory.create_backend(
@@ -93,6 +94,7 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                 owner_pool,
                 directory,
                 True,
+                g3_instance="owner-model",
                 staging_slot_bytes=128 * 1024**2,
                 disks=[
                     dict(
@@ -104,7 +106,8 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                     )
                 ],
             )
-            keys = ["direct-a", "direct-b"]
+            # NUL/non-UTF8 bytes must survive both directory and remote wire paths.
+            keys = [bytes(range(32)).hex(), (b"\xff" + b"\x00" * 31).hex()]
             expected = owner_pool.kv_buffer[:, :128].clone()
             indices = torch.arange(128)
             self.assertEqual(owner.batch_set_v1(keys, indices), [True, True])
@@ -115,6 +118,7 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                 directory,
                 True,
                 disks=[],
+                g3_instance="requester-model",
                 direct_receive=True,
                 enable_trace=True,
                 remote_batch_limit=8,
@@ -174,8 +178,47 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
             self.assertEqual(sum(e["destination_segments"] for e in rpc), 4)
             for event in rpc:
                 self.assertTrue(event["direct_receive"])
+                self.assertGreater(event["owner_metadata_bytes"], 0)
+                self.assertLessEqual(
+                    event["owner_posix_ns"]
+                    + event["owner_ucx_ns"]
+                    + event["owner_metadata_ns"],
+                    event["end_ns"] - event["start_ns"],
+                )
                 self.assertLessEqual(start, event["start_ns"])
                 self.assertLessEqual(event["end_ns"], end)
+
+    def test_clean_reopen_retains_full_keys_but_rejects_other_exact_namespace(self):
+        with tempfile.TemporaryDirectory(
+            dir=os.environ.get("NIXLSHARD_TEST_DIR", "/raid/nixlshard-v2")
+        ) as directory:
+            pool = Pool()
+            key = (b"\x00\xff" * 16).hex()
+            owner = self.backend(pool, directory, True)
+            expected = pool.kv_buffer[:, :2].clone()
+            self.assertEqual(owner.batch_set_v1([key], torch.arange(2)), [True])
+            owner.close()  # Only CLEAN state is eligible for restoration.
+            disk = dict(
+                path=os.path.join(directory, "cache.bin"),
+                capacity_bytes=16 * 1024**2,
+                create=False,
+            )
+            restored = self.backend(pool, directory, True, disks=[disk])
+            before_exists = restored.agent.stats().get("metadata_read_bytes", 0)
+            self.assertEqual(restored.batch_exists([key]), 1)
+            self.assertEqual(
+                restored.agent.stats().get("metadata_read_bytes", 0), before_exists
+            )
+            pool.kv_buffer[:, :2].zero_()
+            self.assertEqual(restored.batch_get_v1([key], torch.arange(2)), [True])
+            torch.testing.assert_close(pool.kv_buffer[:, :2], expected)
+            restored.close()
+            with self.assertRaisesRegex((ValueError, RuntimeError), "namespace|usable"):
+                self.backend(
+                    pool, directory, True, revision="other-model-revision", disks=[disk]
+                )
+            same = self.backend(pool, directory, True, disks=[disk])
+            self.assertEqual(same.batch_exists([key]), 1)
 
     def test_local_direct_reads_use_aligned_rows_and_unaligned_pages_report_fallback(
         self,
@@ -211,7 +254,7 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                     staging_slot_bytes=16384,
                 )
                 expected = pool.kv_buffer[:, :4].clone()
-                keys = ["local-direct-a", "local-direct-b"]
+                keys = page_keys("local-direct-a", "local-direct-b")
                 self.assertEqual(
                     backend.batch_set_v1(keys, torch.arange(4)), [True, True]
                 )
@@ -252,9 +295,17 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                     for e in r["events"]
                     if e["stage"] == "local_posix"
                 ]
+                self.assertEqual(sum(e["bytes"] for e in events), payload_bytes)
                 self.assertEqual(
-                    sum(e["bytes"] for e in events), payload_bytes if aligned else 8192
+                    sum(e["owner_read_bytes"] for e in events),
+                    delta("posix_read_bytes"),
                 )
+                self.assertEqual(
+                    sum(e["owner_staging_copy_bytes"] for e in events),
+                    delta("staging_copy_bytes"),
+                )
+                self.assertGreater(delta("metadata_read_bytes"), 0)
+                self.assertTrue(all(e["owner_metadata_bytes"] > 0 for e in events))
                 self.assertTrue(
                     all(e.get("direct_receive", False) == aligned for e in events)
                 )
@@ -272,7 +323,7 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                 owner_pool, directory, True, enable_trace=True, staging_slot_bytes=16384
             )
             expected = owner_pool.kv_buffer.clone()
-            keys = ["trace-a", "trace-b"]
+            keys = page_keys("trace-a", "trace-b")
             self.assertEqual(owner.batch_set_v1(keys, torch.arange(4)), [True, True])
             reader_pool = Pool("page_first_direct")
             reader_pool.kv_buffer.zero_()
@@ -327,12 +378,18 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                     self.assertLessEqual(before, event["start_ns"])
                     self.assertLessEqual(event["start_ns"], event["end_ns"])
                     self.assertLessEqual(event["end_ns"], after)
-                    if event["stage"] == "remote_rpc":
+                    if event["stage"] in ("remote_rpc", "local_posix"):
                         self.assertIn("owner_posix_ns", event, events)
                         self.assertGreater(event["owner_posix_ns"], 0)
-                        self.assertGreater(event["owner_ucx_ns"], 0)
+                        self.assertGreater(event["owner_metadata_bytes"], 0)
+                        self.assertIn("owner_staging_copy_bytes", event)
+                        if event["stage"] == "remote_rpc":
+                            self.assertGreater(event["owner_ucx_ns"], 0)
                         self.assertLessEqual(
-                            event["owner_posix_ns"] + event["owner_ucx_ns"],
+                            event["owner_posix_ns"]
+                            + event.get("owner_ucx_ns", 0)
+                            + event["owner_metadata_ns"]
+                            + event["owner_staging_copy_ns"],
                             event["end_ns"] - event["start_ns"],
                         )
                 torch.testing.assert_close(pool.kv_buffer[:, :4], expected[:, :4])
@@ -348,7 +405,7 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                     pool = Pool(layout)
                     backend = self.backend(pool, directory, direct_io)
                     expected = pool.kv_buffer.clone()
-                    keys = ["page-a", "page-b", "page-c", "page-d"]
+                    keys = page_keys("page-a", "page-b", "page-c", "page-d")
                     self.assertEqual(
                         backend.batch_set_v1(keys, torch.arange(8)), [True] * 4
                     )
@@ -368,18 +425,22 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
             pool = Pool("layer_first")
             backend = self.backend(pool, directory, direct_io=True)
             expected = pool.kv_buffer[:, :, :2].clone()
-            self.assertEqual(backend.batch_set_v1(["old"], torch.arange(2)), [True])
+            self.assertEqual(
+                backend.batch_set_v1(page_keys("old"), torch.arange(2)), [True]
+            )
             with ThreadPoolExecutor(2) as workers:
-                read = workers.submit(backend.batch_get_v1, ["old"], torch.arange(2, 4))
+                read = workers.submit(
+                    backend.batch_get_v1, page_keys("old"), torch.arange(2, 4)
+                )
                 write = workers.submit(
-                    backend.batch_set_v1, ["new"], torch.arange(4, 6)
+                    backend.batch_set_v1, page_keys("new"), torch.arange(4, 6)
                 )
                 self.assertEqual(read.result(timeout=10), [True])
                 self.assertEqual(write.result(timeout=10), [True])
             torch.testing.assert_close(pool.kv_buffer[:, :, 2:4], expected)
-            self.assertEqual(backend.batch_exists(["old", "absent", "new"]), 1)
+            self.assertEqual(backend.batch_exists(page_keys("old", "absent", "new")), 1)
             self.assertEqual(
-                backend.batch_get_v1(["absent"], torch.arange(6, 8)), [False]
+                backend.batch_get_v1(page_keys("absent"), torch.arange(6, 8)), [False]
             )
             backend.close()
 

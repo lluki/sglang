@@ -42,6 +42,46 @@ def value(registry, name, dimension, component, rank="0"):
 
 
 class TestNativeMetrics(unittest.TestCase):
+    def test_authoritative_ssd_metadata_is_exported_separately_from_payload(self):
+        registry = CollectorRegistry()
+        exporter = NativeMetricsExporter(config(), registry)
+        counters = {
+            "posix_read_bytes": 16777216,
+            "metadata_read_bytes": 4096,
+            "metadata_write_bytes": 8192,
+            "metadata_read_ns": 2500000,
+            "metadata_write_ns": 4000000,
+        }
+        exporter.observe(counters)
+        exporter.observe(counters)
+        for component, expected in (
+            ("posix_read", 16777216),
+            ("metadata_read", 4096),
+            ("metadata_write", 8192),
+        ):
+            self.assertEqual(
+                value(
+                    registry,
+                    "sglang:nixlshard_component_bytes_total",
+                    "component",
+                    component,
+                ),
+                expected,
+            )
+        for component, expected in (
+            ("metadata_read", 0.0025),
+            ("metadata_write", 0.004),
+        ):
+            self.assertEqual(
+                value(
+                    registry,
+                    "sglang:nixlshard_component_seconds_total",
+                    "component",
+                    component,
+                ),
+                expected,
+            )
+
     def test_reattached_agents_share_families_and_keep_totals_without_double_counts(
         self,
     ):

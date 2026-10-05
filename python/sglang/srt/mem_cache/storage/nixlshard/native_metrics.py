@@ -15,6 +15,8 @@ TIMERS = (
     "exists_control_ns",
     "ucx_write_ns",
     "metadata_checkpoint_ns",
+    "metadata_read_ns",
+    "metadata_write_ns",
 )
 BYTES = (
     "staging_copy_bytes",
@@ -24,6 +26,8 @@ BYTES = (
     "ucx_write_bytes",
     "direct_receive_bytes",
     "direct_local_read_bytes",
+    "metadata_read_bytes",
+    "metadata_write_bytes",
 )
 EVENTS = (
     "success",
@@ -90,7 +94,7 @@ def _families(registry=None):
                     ),
                     (
                         "sglang:nixlshard_component_bytes_total",
-                        "Observed cumulative native staging/payload bytes; component counts overlap.",
+                        "Observed cumulative native staging/payload/SSD-metadata bytes; component counts overlap.",
                         "component",
                     ),
                     (

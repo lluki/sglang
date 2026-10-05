@@ -20,9 +20,11 @@ prefix. Controller read-prefix and all-page store policies remain unchanged.
 ## Configuration
 
 Supply the JSON below with `--hicache-storage-backend-extra-config @/path/config.json`.
-The client assigns disk paths and owns NUMA locality. This example initializes
+The client assigns disk paths and the intended NUMA node. This example creates
 a new disposable regular file; use a distinct file/agent per rank. Existing
-block devices must already have the native format and use `create: false`.
+block devices must already have the authoritative-G3 format and use `create:
+false`. Reformatting unknown media requires an explicit native `reset` option;
+opening an incompatible model namespace never silently reformats its contents.
 
 ```json
 {
@@ -30,11 +32,12 @@ block devices must already have the native format and use `create: false`.
   "prefetch_threshold": 64,
   "agent": {
     "name": "qwen-rank-0",
+    "g3_instance": "qwen-kv",
+    "numa_node": 0,
+    "registration_mode": "EXPLICIT",
     "disks": [{
       "path": "/raid/nixlshard-v2/qwen-rank-0-cache.bin",
       "capacity_bytes": 1073741824,
-      "unit_bytes": 65536,
-      "metadata_bytes": 16777216,
       "create": true
     }],
     "listen_host": "127.0.0.1",
@@ -49,10 +52,39 @@ block devices must already have the native format and use `create: false`.
 }
 ```
 
-The model revision is required. Namespaces additionally include model name,
-dtype, layout, tokens/page, layer/head geometry, ordered segment sizes, and
-rank topology. Qwen3-32B's TP1 BF16 host KV uses 16 MiB per 64-token page;
-the staging slot must fit the complete page rounded to allocation units.
+The model revision and nonnegative integer `agent.numa_node` are required.
+`numa_node` is caller-supplied intent; this connector does not infer it from the
+CPU running a worker. The same intended node and configured `g3_instance`
+travel with every store/load, including operations using private staging.
+Existence checks select the configured instance without allocating a staging
+buffer. The adapter uses one model/layout domain per instance and registers
+the host pool once in `EXPLICIT` mode; native `AUTOMATIC` registration and the
+advanced `g3_instances` list are not selected by this adapter.
+
+Native Agent creation is deferred until the concrete host pool is known.
+The complete, canonical JSON model/layout schema becomes `namespace_id` and
+is persisted and checked as exact identity. It includes model name/revision,
+dtype, layout, tokens/page, layer/head geometry, ordered segment sizes, and rank
+topology. The logged namespace SHA256 is a readable diagnostic ID only.
+HiCache's original 64-character SHA256 page key is decoded to its complete
+32 bytes unchanged; it is neither rehashed with the namespace nor truncated.
+Malformed/short keys are rejected. Remote owners match the exact namespace;
+their local instance names can differ.
+
+Before SSD open, each assigned disk receives the exact schema, intended NUMA
+node, `key_bytes: 32`, and `min_object_bytes == max_object_bytes == page bytes`.
+`unit_bytes` is derived by rounding those bytes up to 4 KiB; metadata alignment
+defaults to 4 KiB. Caller-supplied disk identity/NUMA/key-width conflicts fail
+before opening the Agent. Qwen3-32B's TP1 BF16 host KV uses 16 MiB per 64-token
+page, which needs no payload padding; tiny test objects may use the safe staged
+fallback. The staging slot must fit the complete physical page allocation.
+
+The native module must advertise `authoritative_g3_supported`; older cache
+formats/builds fail explicitly. Local G3 allocation records and ordered slot
+lists are authoritative on SSD and read on every payload operation. Its RAM
+directory answers existence without caching these records. CLEAN media can
+restore entries; recognized dirty/invalid media starts empty under the native
+recovery policy. Unknown media is not implicitly authorized for formatting.
 
 Caller hints can be supplied through
 `HiCacheStorageExtraInfo(extra_info={"owner_hints": ["owner-name", ...]})`.
@@ -68,9 +100,12 @@ On the development container, activate the isolated NIXLShard prefix and use
 the pinned SGLang checkout, rather than the image's bundled SGLang tree:
 
 ```bash
-source /workspace/install/nixlshard/env.sh
-export PYTHONPATH=/workspace/src/sglang/python:$PYTHONPATH
-python -c 'import nixlshard; print(nixlshard.__file__, nixlshard.__build_marker__)'
+NIXLSHARD_PREFIX=/workspace/install/nixlshard-g3-20261005
+export PYTHONPATH=/workspace/src/sglang/python:$NIXLSHARD_PREFIX/lib/python3/dist-packages
+export LD_LIBRARY_PATH=$NIXLSHARD_PREFIX/lib:/workspace/deps/abseil/lib:/workspace/deps/ucx/lib
+export NIXL_PLUGIN_DIR=$NIXLSHARD_PREFIX/lib/plugins
+export UCX_TLS=tcp,self,cuda_copy
+python -c 'import nixlshard; print(nixlshard.__file__, nixlshard.__build_marker__, nixlshard.authoritative_g3_supported)'
 python -c 'from sglang.srt.managers.cache_controller import HiCacheController; print(HiCacheController.__name__)'
 python -m unittest discover -s test/registered/unit/mem_cache -p 'test_hicache_nixlshard.py' -v
 SGLANG_RUN_NIXLSHARD_NATIVE=1 python -m unittest discover -s test/registered/unit/mem_cache -p 'test_hicache_nixlshard_native.py' -v
@@ -104,8 +139,8 @@ This is a separate instrumented profile when comparing overhead.
 
 | Metric family | Unit | Fixed label values |
 | --- | --- | --- |
-| `sglang:nixlshard_component_seconds_total` | seconds | `staging_copy`, `posix_read`, `posix_write`, `remote_control`, `exists_control`, `ucx_write`, `metadata_checkpoint` |
-| `sglang:nixlshard_component_bytes_total` | bytes | `staging_copy`, `posix_read`, `posix_write`, `remote_read`, `ucx_write` |
+| `sglang:nixlshard_component_seconds_total` | seconds | `staging_copy`, `posix_read`, `posix_write`, `remote_control`, `exists_control`, `ucx_write`, `metadata_checkpoint`, `metadata_read`, `metadata_write` |
+| `sglang:nixlshard_component_bytes_total` | bytes | `staging_copy`, `posix_read`, `posix_write`, `remote_read`, `ucx_write`, `metadata_read`, `metadata_write`, `direct_receive`, `direct_local_read` |
 | `sglang:nixlshard_events_total` | events | native worker statuses and the fixed resource/failure fields in `native_metrics.py` |
 
 Labels identify the configured model and TP/DP/PP/attention-CP ranks and sizes,
@@ -126,9 +161,11 @@ These are aggregate wall intervals and counters across native workers and
 background work. `remote_control` includes owner SSD I/O, owner UCX write and
 control response wait; it overlaps owner-side timers. POSIX intervals include
 submission/progress/draining, and successful POSIX bytes include allocation
-padding. Staging bytes are logical gather/scatter bytes and may count both
-directions. Checkpoint timing covers periodic/explicit checkpoints; eager
-reclamation is not timed separately. Event statuses describe batch workers,
+padding. Allocation-record/header I/O is exported separately as
+`metadata_read`/`metadata_write` bytes and wall seconds, so payload-byte proofs
+do not treat metadata as KV. Staging bytes are logical gather/scatter bytes and
+may count both directions. Checkpoint timing covers periodic/explicit
+checkpoints where supported. Event statuses describe batch workers,
 rather than every incoming RPC. Failed exists RPCs contribute to their timer.
 
 For native builds supporting `remote_batch_limit`, three event labels describe
@@ -175,7 +212,7 @@ grouping also respects slot capacity and falls back to individual loads after
 a known-quiescent owner `no_space` response. Caller buffers retain the existing
 registration, cancellation and completion rules.
 
-The matched GB200 experiment used native `ff5aa4879101` and serving SGLang
+The historical matched GB200 experiment used native `ff5aa4879101` and serving SGLang
 `cfe719424937`, Qwen3-32B-FP8 with BF16 KV, page size 64, a 16 GB host cache,
 and one request outstanding. Five measured streaming requests per context,
 after one warmup, reduced median remote TTFT by 5.7% to 17.3% for 512 through

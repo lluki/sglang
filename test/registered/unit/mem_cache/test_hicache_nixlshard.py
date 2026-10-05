@@ -5,6 +5,7 @@
 import ctypes
 import gc
 import hashlib
+import json
 import sys
 import threading
 import types
@@ -537,6 +538,59 @@ class TestHiCacheNixlShard(unittest.TestCase):
         torch.testing.assert_close(pool.kv_buffer[:, :, :2], expected[:, :, :2])
         self.assertEqual(pool.kv_buffer[:, :, 2:4].count_nonzero().item(), 0)
         self.assertEqual(backend.get_stats()["get_hits"], 1)
+
+    def test_runtime_domain_witness_preserves_exact_schema_without_peer_credentials(
+        self,
+    ):
+        storage_config = config()
+        storage_config.extra_config["agent"].update(
+            g3_instance="requester-domain",
+            numa_node=2,
+            peers={"peer": {"host": "private-peer-address", "port": 19010}},
+            credential="must-not-appear-in-domain-witness",
+        )
+        backend = StorageBackendFactory.create_backend(
+            "nixlshard", storage_config, Pool()
+        )
+        self.backends.append(backend)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.nixlshard.hicache_nixlshard", level="INFO"
+        ) as logs:
+            backend.register_mem_pool_host(Pool())
+        line = next(
+            record.getMessage()
+            for record in logs.records
+            if record.getMessage().startswith("HiCacheNixlShard domain=")
+        )
+        witness = json.loads(line.split("domain=", 1)[1])
+        self.assertEqual(witness["namespace_id"], backend.agent.config["namespace_id"])
+        self.assertEqual(
+            json.dumps(
+                json.loads(witness["namespace_id"]),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            witness["namespace_id"],
+        )
+        self.assertEqual(witness["storage_contract"], "authoritative_g3_v2")
+        self.assertEqual(
+            (witness["g3_instance"], witness["numa_node"]), ("requester-domain", 2)
+        )
+        self.assertEqual(
+            (witness["min_object_bytes"], witness["max_object_bytes"]),
+            (backend._page_bytes, backend._page_bytes),
+        )
+        self.assertEqual(
+            (
+                witness["unit_bytes"],
+                witness["key_bytes"],
+                witness["metadata_alignment"],
+            ),
+            (4096, 32, 4096),
+        )
+        self.assertNotIn("private-peer-address", line)
+        self.assertNotIn("must-not-appear-in-domain-witness", line)
+        self.assertNotIn("peers", witness)
 
     def test_schema_and_geometry_are_bound_before_ssd_open(self):
         storage_config = config()

@@ -254,6 +254,28 @@ class HiCacheNixlShard(HiCacheStorage):
                 self.g3_instance,
                 self.numa_node,
             )
+            # A standalone owner consumes the exact runtime identity rather
+            # than reconstructing it from model names or a diagnostic digest.
+            # Whitelist only domain/geometry fields, never the Agent config.
+            logger.info(
+                "HiCacheNixlShard domain=%s",
+                json.dumps(
+                    {
+                        "storage_contract": "authoritative_g3_v2",
+                        "namespace_id": self.namespace_identity,
+                        "g3_instance": self.g3_instance,
+                        "numa_node": self.numa_node,
+                        "registration_mode": "EXPLICIT",
+                        "min_object_bytes": self._page_bytes,
+                        "max_object_bytes": self._page_bytes,
+                        "unit_bytes": ((self._page_bytes + 4095) // 4096) * 4096,
+                        "key_bytes": 32,
+                        "metadata_alignment": 4096,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
 
     def _config_for_pool(self):
         config = copy.deepcopy(self._agent_config)

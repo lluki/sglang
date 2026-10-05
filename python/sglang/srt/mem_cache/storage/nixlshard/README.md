@@ -71,6 +71,14 @@ HiCache's original 64-character SHA256 page key is decoded to its complete
 Malformed/short keys are rejected. Remote owners match the exact namespace;
 their local instance names can differ.
 
+The registration log also emits one `HiCacheNixlShard domain=` JSON witness
+containing the actual exact schema, intended affinity and page geometry, with
+peer/credential fields excluded. For a standalone remote owner, first start
+the diskless SGLang requester, parse this witness, validate its namespace JSON
+round-trip, and supply that exact `namespace_id` plus geometry before opening
+the owner's SSD. Preserve the witness in sanitized launch provenance; do not
+substitute the readable namespace digest or reconstruct a similar schema.
+
 Before SSD open, each assigned disk receives the exact schema, intended NUMA
 node, `key_bytes: 32`, and `min_object_bytes == max_object_bytes == page bytes`.
 `unit_bytes` is derived by rounding those bytes up to 4 KiB; metadata alignment

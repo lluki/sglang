@@ -64,6 +64,8 @@ class TestRequestTimeline(unittest.TestCase):
         backend = object.__new__(HiCacheNixlShard)
         backend.agent = agent
         backend._trace_requests = True
+        backend.native_config = {"enable_trace": True}
+        backend._timeout = None
         backend._condition = threading.Condition()
         backend._stats = Counter()
         backend.build_marker = "test-build"
@@ -121,11 +123,14 @@ class TestRequestTimeline(unittest.TestCase):
                     ]
 
                 agent = SimpleNamespace(
-                    poll=lambda handle: ["success"],
+                    poll=lambda handle: "SUCCESS",
                     trace=trace,
                     release=lambda handle: order.append(("release", handle)),
                 )
-                self.assertEqual(self.backend(agent)._wait(42, 1, "request-42"), [True])
+                self.assertEqual(self.backend(agent)._wait(
+                    42, [{"namespace": "kv", "key": b"key"}],
+                    SimpleNamespace(extra_info={"request_id": "request-42"}),
+                ), [True])
                 self.assertEqual(order, [("trace", 42), ("release", 42)])
                 record = self.records(directory)[0]
                 self.assertEqual(record["rid"], "request-42")
@@ -145,11 +150,14 @@ class TestRequestTimeline(unittest.TestCase):
         ), patch.object(request_timeline, "_warned", True):
             self.assertFalse(request_timeline.emit("id", "test"))
             agent = SimpleNamespace(
-                poll=lambda handle: ["success"],
+                poll=lambda handle: "SUCCESS",
                 trace=lambda handle: [],
                 release=lambda handle: None,
             )
-            self.assertEqual(self.backend(agent)._wait(0, 1, "id"), [True])
+            self.assertEqual(self.backend(agent)._wait(
+                1, [{"namespace": "kv", "key": b"key"}],
+                SimpleNamespace(extra_info={"request_id": "id"}),
+            ), [True])
 
     def test_concurrent_threads_keep_complete_json_records(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(

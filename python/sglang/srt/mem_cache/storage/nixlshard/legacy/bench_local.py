@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
-"""Correctness-checked synthetic CPU KV/file microbenchmark (not model TTFT)."""
+"""Archived segmented-buffer benchmark for historical reproduction only.
+
+This source targets the pre-migration native API. Use the current adapter native
+tests and standalone NIXLShard tools to validate and measure the whole-page API.
+"""
 
 import argparse
 import json

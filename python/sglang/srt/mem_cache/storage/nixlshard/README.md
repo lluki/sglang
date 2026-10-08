@@ -109,9 +109,7 @@ active detach, concurrent prefetch/backup, clean recovery, actual POSIX counters
 and two-Agent UCX TCP payloads with staged and direct receive. These tests do
 not establish RDMA performance.
 
-The former segmented-buffer benchmark is archived at
-`legacy/bench_local.py`; it targets the previous native API and is retained for
-historical reproduction. Current correctness and payload-path measurements use
-the native tests above and the standalone NIXLShard repository's tools.
+Current correctness and payload-path measurements use the native tests above
+and the standalone NIXLShard repository's supported tools.
 Reproduce measurements with the migrated native library and this adapter's
 implementation marker.

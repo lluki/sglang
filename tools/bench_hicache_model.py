@@ -133,7 +133,8 @@ def main():
 
     def redact(value):
         if isinstance(value, dict):
-            return {key: "<redacted>" if key in {"api_key", "admin_api_key"} else redact(item)
+            # server_info also embeds credentials in its shell launch command.
+            return {key: "<redacted>" if key in {"api_key", "admin_api_key", "launch_command"} else redact(item)
                     for key, item in value.items()}
         if isinstance(value, list):
             return [redact(item) for item in value]

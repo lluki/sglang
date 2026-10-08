@@ -113,3 +113,21 @@ Current correctness and payload-path measurements use the native tests above
 and the standalone NIXLShard repository's supported tools.
 Reproduce measurements with the migrated native library and this adapter's
 implementation marker.
+
+## Real-model measurements
+
+`tools/bench_hicache_model.py` drives a running server with one request outstanding,
+records the first received nonempty output event, and checks `cached_tokens_details`
+and native byte counters before accepting a cache-tier result. It saves exact input
+tokens/cache salts, streamed events and full-generation/background counter windows;
+those cumulative timers are not a causal TTFT breakdown. `--replay-from` reuses a
+prior run's cold references for a diskless requester measuring remote storage only.
+
+Set `SGLANG_REQUEST_TIMELINE_DIR` before server launch and enable the Agent's
+`enable_trace` to join native diagnostics to the client's supplied request IDs.
+Extra configuration `diagnostic_logging=true` records per-operation physical
+components, direct framework-pool bytes, packed-buffer bytes and pack/unpack copy
+bytes/nanoseconds. Host registration logs actual component count and adjacency.
+The Qwen3 MHA host pool separates K/V even in `page_first_direct`; native direct
+receive into its owned packed buffer still requires framework-pool unpack copies
+and must not be reported as framework receiver zero-copy.

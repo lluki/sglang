@@ -66,6 +66,7 @@ class HiCacheNixlShard(HiCacheStorage):
         }
         self._native_exporter = None
         self._export_native_metrics = bool(extra.get("export_native_metrics", False))
+        self._diagnostic_logging = bool(extra.get("diagnostic_logging", False))
         self._timeout = extra.get("transfer_timeout_seconds")
         if self._timeout is not None and (
             not isinstance(self._timeout, (int, float)) or self._timeout <= 0
@@ -174,9 +175,12 @@ class HiCacheNixlShard(HiCacheStorage):
                 raise
             self.registered_pools[namespace] = pool
             logger.info(
-                "HiCacheNixlShard implementation=%s native=%s pool=%s bytes/page=%d numa=%d",
+                "HiCacheNixlShard implementation=%s native=%s pool=%s bytes/page=%d numa=%d "
+                "page_components=%d contiguous_page=%s registered_allocations=%d alignment_mod4096=%d",
                 self.implementation_marker, self.build_marker, namespace,
-                sum(lengths), self.numa_node,
+                sum(lengths), self.numa_node, len(ranges),
+                all(ranges[i][0] + ranges[i][1] == ranges[i + 1][0] for i in range(len(ranges) - 1)),
+                len(owned), ranges[0][0] % 4096,
             )
 
     @contextmanager
@@ -306,6 +310,8 @@ class HiCacheNixlShard(HiCacheStorage):
             hints = self._hints(extra_info, len(keys), namespace)
             results = []
             started = time.perf_counter()
+            diagnostic_start_ns = time.monotonic_ns() if self._diagnostic_logging else 0
+            copies = Counter() if self._diagnostic_logging else None
             for first in range(0, len(keys), min(STORAGE_BATCH_SIZE, 128)):
                 batch = pages[first:first + min(STORAGE_BATCH_SIZE, 128)]
                 begin = first * pool.page_size
@@ -340,9 +346,13 @@ class HiCacheNixlShard(HiCacheStorage):
                                 for source, size in ranges:
                                     ctypes.memmove(pointer + offset, source, size)
                                     offset += size
+                                copy_ns = time.perf_counter_ns() - copied_at
                                 with self._condition:
                                     self._stats["pack_bytes"] += length
-                                    self._stats["pack_ns"] += time.perf_counter_ns() - copied_at
+                                    self._stats["pack_ns"] += copy_ns
+                                if copies is not None:
+                                    copies["pack_bytes"] += length
+                                    copies["pack_ns"] += copy_ns
                         item = {
                             "key": native_keys[first + index], "namespace": namespace,
                             "buffer": (pointer, length, 0),
@@ -366,9 +376,19 @@ class HiCacheNixlShard(HiCacheStorage):
                                 for destination, size in ranges:
                                     ctypes.memmove(destination, pointer + offset, size)
                                     offset += size
+                                copy_ns = time.perf_counter_ns() - copied_at
                                 with self._condition:
                                     self._stats["unpack_bytes"] += length
-                                    self._stats["unpack_ns"] += time.perf_counter_ns() - copied_at
+                                    self._stats["unpack_ns"] += copy_ns
+                                if copies is not None:
+                                    copies["unpack_bytes"] += length
+                                    copies["unpack_ns"] += copy_ns
+                    if copies is not None:
+                        packed_indices = {index for index, *_ in packed}
+                        for index, (ranges, hit) in enumerate(zip(batch, batch_results)):
+                            if hit and ranges:
+                                copies["physical_components"] += len(ranges)
+                                copies["packed_buffer_bytes" if index in packed_indices else "framework_pool_bytes"] += sum(n for _, n in ranges)
                     results.extend(batch_results)
                 finally:
                     # _wait observes terminal polling before release; all native
@@ -386,6 +406,17 @@ class HiCacheNixlShard(HiCacheStorage):
                 prefix = "prefetch" if direction == "get" else "backup"
                 self._metric_samples[f"{prefix}_pgs"].append(sum(results))
                 self._metric_samples[f"{prefix}_bandwidth"].append(transferred / elapsed / 1024**3)
+            if self._diagnostic_logging:
+                request_id = ((extra_info.extra_info or {}) if extra_info else {}).get("request_id")
+                fields = {key: copies[key] for key in (
+                    "physical_components", "framework_pool_bytes", "packed_buffer_bytes",
+                    "pack_bytes", "pack_ns", "unpack_bytes", "unpack_ns",
+                )}
+                logger.info("HiCacheNixlShard transfer direction=%s pool=%s pages=%d hits=%d copies=%s",
+                            direction, namespace, len(results), sum(results), fields)
+                request_timeline.emit(request_id, "adapter_transfer", start_ns=diagnostic_start_ns,
+                                      end_ns=time.monotonic_ns(), direction=direction, pool=namespace,
+                                      pages=len(results), hits=sum(results), **fields)
             return results
 
     def batch_get_v1(self, keys, host_indices, extra_info=None):

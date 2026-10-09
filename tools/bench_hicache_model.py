@@ -45,7 +45,9 @@ def verify_tier(record, tier, expected, page_size, receive_mode=None):
         if receive_mode == "native_staged" and direct:
             raise RuntimeError("staged receive unexpectedly contains direct GET bytes")
         owner = record.get("owner_stats_delta_full_generation_background")
-        if owner is not None and (owner.get("posix_read_bytes", 0) != remote or owner.get("ssd_metadata_read_bytes", 0) <= 0):
+        # Native metadata_read_bytes takes precedence over its historical alias.
+        metadata = 0 if owner is None else owner.get("metadata_read_bytes", owner.get("ssd_metadata_read_bytes", 0))
+        if owner is not None and (owner.get("posix_read_bytes", 0) != remote or metadata <= 0):
             raise RuntimeError("remote GET lacks matched positive owner payload/SSD metadata witnesses")
     return {"exact_output_match": True, "exclusive_tier_verified": True,
             "cache": cache, "semantic_answer_verified": expected.lstrip().startswith("4")}

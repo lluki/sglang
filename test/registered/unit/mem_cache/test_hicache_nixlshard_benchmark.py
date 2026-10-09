@@ -43,6 +43,36 @@ class TestModelBenchmarkWitnesses(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             benchmark.verify_tier(self.remote(), "warm_remote_ssd", "5\n", 64, "native_direct")
 
+    def test_native_metadata_counter_is_preferred_and_legacy_is_compatible(self):
+        for owner in (
+            {"metadata_read_bytes": 7 * 4096},
+            {"metadata_read_bytes": 7 * 4096, "ssd_metadata_read_bytes": 0},
+            {"ssd_metadata_read_bytes": 7 * 4096},
+        ):
+            with self.subTest(owner=owner):
+                row = self.remote()
+                row["owner_stats_delta_full_generation_background"] = {
+                    "posix_read_bytes": 7 * 16777216, **owner,
+                }
+                self.assertTrue(benchmark.verify_tier(
+                    row, "warm_remote_ssd", "4\n", 64, "native_direct"
+                )["exclusive_tier_verified"])
+
+    def test_native_metadata_zero_or_absence_cannot_be_hidden_by_alias(self):
+        for owner in (
+            {},
+            {"metadata_read_bytes": 0, "ssd_metadata_read_bytes": 7 * 4096},
+            {"metadata_read_bytes": -1, "ssd_metadata_read_bytes": 7 * 4096},
+            {"ssd_metadata_read_bytes": 0},
+        ):
+            with self.subTest(owner=owner):
+                row = self.remote()
+                row["owner_stats_delta_full_generation_background"] = {
+                    "posix_read_bytes": 7 * 16777216, **owner,
+                }
+                with self.assertRaises(RuntimeError):
+                    benchmark.verify_tier(row, "warm_remote_ssd", "4\n", 64, "native_direct")
+
     def test_staged_remote_has_no_direct_bytes_but_separate_store_copy_is_allowed(self):
         row = self.remote()
         row["native_bytes_delta_full_generation_background"].update(direct_receive=0, staging_copy=117440512)

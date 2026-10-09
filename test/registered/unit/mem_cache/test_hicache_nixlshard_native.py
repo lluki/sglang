@@ -92,6 +92,42 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                 self.assertGreater(owner.agent.stats().get("ucx_write_bytes", 0), 0)
                 self.assertEqual(reader.get_stats().get("unpack_bytes", 0), 256)
 
+    def test_diskless_explicit_v1_v2_writes_raise_and_leave_no_pending_resources(self):
+        for layout in ("page_first", "layer_first"):
+            with self.subTest(layout=layout):
+                pool = Pool(layout)
+                backend = self.backend(pool, self.directory(), disks=[])
+                secondary = Pool(layout)
+                backend.register_mem_host_pool_v2(secondary, PoolName.INDEXER)
+                keys = page_keys("diskless-one", "diskless-two")
+                indices = torch.arange(4)
+                transfers = [
+                    PoolTransfer(PoolName.KV, host_indices=indices, keys=keys),
+                    PoolTransfer(PoolName.INDEXER, host_indices=indices, keys=keys),
+                ]
+                before = [pool.bytes(), secondary.bytes()]
+                registered_regions = backend.agent.stats()["registered_regions"]
+                message = "^NIXLShard storage writes require an assigned local SSD$"
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    backend.batch_set_v1(keys, indices)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    backend.batch_set_v2(transfers)
+
+                self.assertFalse(pool.leases)
+                self.assertFalse(secondary.leases)
+                self.assertEqual([pool.bytes(), secondary.bytes()], before)
+                self.assertEqual(backend.batch_exists(keys), 0)
+                stats = backend.agent.stats()
+                self.assertEqual(stats["registered_regions"], registered_regions)
+                self.assertEqual(stats["retained_handles"], 0)
+                self.assertEqual(stats["in_progress_batches"], 0)
+                self.assertEqual(stats.get("posix_write_bytes", 0), 0)
+                self.assertEqual(backend.get_stats().get("pack_bytes", 0), 0)
+                backend.close()
+                self.assertFalse(pool.leases)
+                self.assertFalse(secondary.leases)
+
     def test_clean_reopen_retains_ascii_keys_and_distinct_pool_namespaces(self):
         directory = self.directory()
         pool = Pool()

@@ -347,7 +347,11 @@ class BufferModePipeline:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
         Rejected intents are counted; the node re-triggers on a later hit."""
-        if not self._cache.enable_storage:
+        if (
+            not self._cache.enable_storage
+            or self._cache.cache_controller is None
+            or not self._cache.cache_controller.can_write_storage
+        ):
             return
         if node_id in self.inflight_backup_node_ids:
             return
@@ -665,6 +669,12 @@ class BufferModePipeline:
         snapshot = intent.snapshot
         self._cache.dec_lock_ref(snapshot.node_id, entry.lock_params)
 
+        if not self._cache.cache_controller.can_write_storage:
+            # D2H has completed, so a declined persistent write can release
+            # its transient slots without claiming the content was stored.
+            self._release_backup_staging(entry)
+            return
+
         # Every independently staged aux pool writes a trailing snapshot keyed
         # by the last KV page hashes it covers.  A derived sidecar writes the
         # exact key span of its source pool while reusing that source's slots.
@@ -714,6 +724,9 @@ class BufferModePipeline:
             snapshot.prefix_keys,
             extra_pools=storage_xfers or None,
         )
+        if operation_id is None:
+            self._release_backup_staging(entry)
+            return
         self.ongoing_backup[operation_id] = entry
 
     def finish_storage_write_ack(self, operation_id: int) -> None:
@@ -728,6 +741,10 @@ class BufferModePipeline:
         intent = entry.intent
         snapshot = intent.snapshot
         self._cache.storage_existence_cache.add(PoolName.KV, snapshot.hash_values)
+        self._release_backup_staging(entry)
+
+    def _release_backup_staging(self, entry: _UnifiedBufferBackupEntry) -> None:
+        snapshot = entry.intent.snapshot
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= len(entry.host_indices)
         self.inflight_backup_node_ids.discard(snapshot.node_id)

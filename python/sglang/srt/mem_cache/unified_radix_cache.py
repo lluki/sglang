@@ -1826,7 +1826,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus
     def write_backup_storage(self, node_id: NodeId) -> None:
-        if not self.enable_storage or self.cache_controller is None:
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or not self.cache_controller.can_write_storage
+        ):
             return
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
@@ -1852,6 +1856,8 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        if operation_id is None:
+            return
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),

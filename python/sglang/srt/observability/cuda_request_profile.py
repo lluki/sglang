@@ -145,6 +145,13 @@ def _method(event, name, default=None):
         return default
 
 
+def _stage_annotation(name):
+    # C++ custom operators use the sglang:: namespace; only our explicit
+    # record_function scopes carry request-stage attribution.
+    return name in ("sglang:h2d", "sglang:model_prefill", "sglang:model_decode",
+                    "sglang:d2h_backup") or name.startswith("sglang:clock_probe:")
+
+
 def select_events(events, anchors, probes):
     """Extract absolute correlated activity; preserve missing joins explicitly."""
     bounds = [anchor_offset_bounds(a) for a in anchors]
@@ -170,7 +177,7 @@ def select_events(events, anchors, probes):
             "flow_type": str(_method(event, "flow_type", "")),
             "bytes": _method(event, "nbytes", 0),
         })
-    annotations = [e for e in entries if "CPU" in e["device_type"] and e["name"].startswith("sglang:")]
+    annotations = [e for e in entries if "CPU" in e["device_type"] and _stage_annotation(e["name"])]
     cpu = [e for e in entries if "CPU" in e["device_type"]]
     by_correlation, by_external = defaultdict(list), defaultdict(list)
     for entry in cpu:
@@ -212,7 +219,7 @@ def select_events(events, anchors, probes):
         containers = [annotation_for_cpu[e["index"]] for e in launch if e["index"] in annotation_for_cpu]
         parent = min(containers, key=lambda a: a["end_ns"]-a["start_ns"]) if containers else None
         stage = parent["name"][7:] if parent else None
-        gpu_envelope = event["name"].startswith("sglang:") or event["name"] in (
+        gpu_envelope = _stage_annotation(event["name"]) or event["name"] in (
             "Context Sync", "Stream Sync", "Event Sync", "Stream Wait Event")
         if stage and stage.startswith("clock_probe:"):
             # CUPTI synchronization intervals can begin at earlier queued work.

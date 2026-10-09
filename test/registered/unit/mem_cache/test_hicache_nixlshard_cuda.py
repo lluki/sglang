@@ -64,6 +64,24 @@ class TestCUDARequestActivity(unittest.TestCase):
         self.assertEqual(calibration["gpu_probes"][0]["offset_lower_ns"], -20)
         self.assertEqual(calibration["gpu_probes"][0]["offset_upper_ns"], 20)
 
+    def test_custom_operator_namespace_preserves_outer_stage_and_actual_kernel(self):
+        events = [
+            event("sglang:model_prefill", 100, 200),
+            event("sglang::custom_op", 120, 160),
+            event("cudaLaunchKernel", 130, 140, corr=7),
+            event("sglang::example_kernel", 150, 190, "CUDA", corr=7),
+        ]
+        selected, _ = select_events(events, [], [])
+        kernel = next(e for e in selected if "CUDA" in e["device_type"])
+        self.assertEqual(kernel["category"], "model_prefill")
+        self.assertEqual(kernel["joined_stage"], "model_prefill")
+        self.assertEqual(kernel["parent_annotation"], 0)
+        self.assertEqual(kernel["launch_event_indices"], [2])
+        self.assertFalse(kernel["envelope"])
+        self.assertEqual((kernel["index"], kernel["name"], kernel["start_ns"],
+                          kernel["end_ns"], kernel["correlation_id"]),
+                         (3, "sglang::example_kernel", 150, 190, 7))
+
     def test_unjoined_gpu_activity_is_other_and_not_falsely_attributed_to_prefill(self):
         selected, calibration = select_events(
             [event("foreign_kernel", 10, 20, "CUDA")], [], [])

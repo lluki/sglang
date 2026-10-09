@@ -4,7 +4,7 @@ import unittest
 import time
 from unittest.mock import patch
 from sglang.srt.observability.cuda_request_profile import (
-    anchor_offset_bounds, clock_probe_bounds, select_events,
+    anchor_offset_bounds, calibrate_probe_groups, clock_probe_bounds, select_events,
 )
 
 
@@ -60,7 +60,7 @@ class TestCUDARequestActivity(unittest.TestCase):
         self.assertEqual(selected[0]["launch_event_indices"], [4])
         self.assertEqual([e["start_ns"] for e in selected], [770, 880])
         self.assertEqual(selected[0]["end_ns"], 850)
-        self.assertTrue(calibration["gpu_clock_mapping_verified"])
+        self.assertFalse(calibration["gpu_clock_mapping_verified"], "one probe per site cannot satisfy the five-probe contract")
         self.assertEqual(calibration["gpu_probes"][0]["offset_lower_ns"], -20)
         self.assertEqual(calibration["gpu_probes"][0]["offset_upper_ns"], 20)
 
@@ -81,6 +81,35 @@ class TestCUDARequestActivity(unittest.TestCase):
             stop.assert_not_called()
             profile.flush_completed()
             stop.assert_called_once_with("test-request")
+
+    def groups(self):
+        return [{"label": f"{site}:{i}", "site": site, "probe_index": i,
+                 "host_start_ns": 1000 * group + 100 * i, "host_end_ns": 1000 * group + 100 * i + 80,
+                 "offset_lower_ns": -10 + i, "offset_upper_ns": 20 - i, "actual_gpu_kernels": 1}
+                for group, site in enumerate(("before", "after")) for i in range(5)]
+
+    def test_complete_actual_probe_groups_intersect_only_at_each_site_and_use_endpoint_hull(self):
+        probes = self.groups()
+        for p in probes[5:]:
+            p["offset_lower_ns"] += 5
+            p["offset_upper_ns"] += 5
+        value = calibrate_probe_groups(probes)
+        self.assertTrue(value["gpu_clock_mapping_verified"])
+        self.assertEqual(value["gpu_probe_groups"][0]["offset_lower_ns"], -6)
+        self.assertEqual(value["gpu_probe_groups"][0]["offset_upper_ns"], 16)
+        self.assertEqual(value["gpu_request_offset_hull"]["offset_lower_ns"], -6)
+        self.assertEqual(value["gpu_request_offset_hull"]["offset_upper_ns"], 21)
+
+    def test_missing_duplicate_or_contradictory_probe_groups_are_unverified(self):
+        for kind in ("missing", "duplicate", "contradictory", "no-kernel"):
+            probes = self.groups()
+            if kind == "missing":probes.pop()
+            elif kind == "duplicate":probes[-1]["probe_index"] = 0
+            elif kind == "no-kernel":probes[-1]["actual_gpu_kernels"] = 0
+            else:probes[-1]["offset_lower_ns"] = 100
+            value = calibrate_probe_groups(probes)
+            self.assertFalse(value["gpu_clock_mapping_verified"])
+            self.assertIsNone(value["gpu_request_offset_hull"])
 
     def test_model_sized_correlations_and_cpu_hierarchy_have_bounded_collection_cost(self):
         events = []

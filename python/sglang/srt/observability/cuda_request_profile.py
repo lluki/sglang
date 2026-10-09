@@ -45,13 +45,43 @@ def clock_probe_bounds(host_start, host_end, gpu_start, gpu_end):
 
 def _clock_probe(state, label):
     import torch
-    before = time.monotonic_ns()
-    with torch.cuda.stream(state["probe_stream"]), torch.profiler.record_function("sglang:clock_probe:" + label):
-        state["probe_tensor"].zero_()
-        state["probe_stream"].synchronize()
-    after = time.monotonic_ns()
-    state["probes"].append({"label": label, "host_start_ns": before,
-                            "host_end_ns": after})
+    for index in range(5):
+        unique = f"{label}:{index}"
+        with torch.cuda.stream(state["probe_stream"]), torch.profiler.record_function("sglang:clock_probe:" + unique):
+            before = time.monotonic_ns()
+            state["probe_tensor"].zero_()
+            state["probe_stream"].synchronize()
+            after = time.monotonic_ns()
+        state["probes"].append({"label": unique, "site": label, "probe_index": index,
+                                "host_start_ns": before, "host_end_ns": after})
+
+
+def calibrate_probe_groups(calibrated, expected_per_site=5):
+    """Intersect compatible same-site probes; retain a conservative endpoint hull."""
+    groups = []
+    for site in ("before", "after"):
+        probes = [p for p in calibrated if p.get("site", p["label"].split(":", 1)[0]) == site]
+        indices = {p.get("probe_index") for p in probes}
+        complete = (len(probes) == expected_per_site and indices == set(range(expected_per_site))
+                    and all(p.get("actual_gpu_kernels", 0) > 0 for p in probes))
+        lower = max((p["offset_lower_ns"] for p in probes), default=None)
+        upper = min((p["offset_upper_ns"] for p in probes), default=None)
+        compatible = bool(probes) and lower <= upper
+        groups.append({"site": site, "probe_count": len(probes), "expected_probe_count": expected_per_site,
+                       "complete": complete, "compatible": compatible,
+                       "offset_lower_ns": lower, "offset_upper_ns": upper,
+                       "host_start_ns": min((p["host_start_ns"] for p in probes), default=None),
+                       "host_end_ns": max((p["host_end_ns"] for p in probes), default=None),
+                       "labels": [p["label"] for p in probes]})
+    verified = all(g["complete"] and g["compatible"] for g in groups)
+    hull = ({"offset_lower_ns": min(g["offset_lower_ns"] for g in groups),
+             "offset_upper_ns": max(g["offset_upper_ns"] for g in groups),
+             "valid_start_ns": groups[0]["host_start_ns"], "valid_end_ns": groups[1]["host_end_ns"]}
+            if verified else None)
+    return {"gpu_probe_groups": groups, "gpu_clock_mapping_verified": verified,
+            "gpu_request_offset_hull": hull,
+            "gpu_clock_conversion_model": "Kineto absolute CPU-wall timestamps mapped by measured wall/monotonic brackets; GPU residual offset measured by completed private-stream kernels",
+            "gpu_clock_validity_model": "constant residual offset within each sequential five-probe site; bounded endpoint-hull drift over this enclosed request window; no extrapolation and no request-wide constant offset assumption"}
 
 
 def start(rid):
@@ -228,13 +258,15 @@ def select_events(events, anchors, probes):
             continue
         first = min(e["start_ns"] for e in gpu)
         last = max(e["end_ns"] for e in gpu)
-        lower, upper = clock_probe_bounds(
-            probe["host_start_ns"], probe["host_end_ns"], first, last)
-        calibrated.append(dict(probe, gpu_start_ns=first, gpu_end_ns=last,
-                               offset_lower_ns=lower, offset_upper_ns=upper))
+        # Preserve even a rejected initial CUPTI probe's actual intervals;
+        # contradictory bounds invalidate its site instead of discarding proof.
+        lower, upper = last - probe["host_end_ns"], first - probe["host_start_ns"]
+        calibrated.append(dict(probe, gpu_start_ns=first, gpu_end_ns=last, actual_gpu_kernels=len(gpu), gpu_kernels=gpu,
+                               offset_lower_ns=lower, offset_upper_ns=upper,
+                               probe_interval_compatible=lower <= upper))
     return sorted(selected + list(retained_cpu.values()), key=lambda e: e["index"]), {
         "wall_monotonic_anchors": anchors, "wall_anchor_uncertainty_ns": wall_error,
-        "gpu_probes": calibrated, "gpu_clock_mapping_verified": len(calibrated) == len(probes) == 2,
+        "gpu_probe_host_brackets": probes, "gpu_probes": calibrated, **calibrate_probe_groups(calibrated),
         "gpu_clock_probe_scope": "CUPTI-converted GPU minus CPU monotonic offset; each kernel bracketed by CPU launch and synchronized completion",
         "correlation_join": "GPU correlation/external IDs to CPU launch contained by named stage annotation",
     }

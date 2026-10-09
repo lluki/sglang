@@ -33,6 +33,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.observability import request_timeline
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
@@ -86,6 +87,7 @@ class SchedulerRequestReceiver:
         return num_recv_reqs >= self.max_recv_per_poll
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
+    @request_timeline.phase("scheduler_receive_poll", requests="received")
     def recv_requests(
         self, local_reqs: Optional[List[AbortReq]] = None
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:

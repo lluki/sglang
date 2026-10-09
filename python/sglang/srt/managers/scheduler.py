@@ -294,6 +294,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability import request_timeline
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -2104,6 +2105,7 @@ class Scheduler(
         return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
+    @request_timeline.phase("scheduler_process_inputs", requests="inputs")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -2767,6 +2769,7 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    @request_timeline.phase("scheduler_request_process")
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -3123,6 +3126,7 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
+    @request_timeline.phase("scheduler_prefetch_admission")
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3629,6 +3633,7 @@ class Scheduler(
                 self._process_storage_prefetch_retries()
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
+    @request_timeline.phase("scheduler_get_next_batch", requests="pending")
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
@@ -3962,15 +3967,22 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(
-                    req.cache_request_handle
-                )
+                prefetch_diagnostic = {}
+                with request_timeline.scope(
+                    req.rid, "scheduler_prefetch_progress", category="framework_queue",
+                    details=prefetch_diagnostic,
+                ):
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        req.cache_request_handle
+                    )
+                    prefetch_diagnostic["prefetch_done"] = bool(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
@@ -4312,6 +4324,9 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
+    @request_timeline.phase(
+        "scheduler_run_batch", requests="batch", forward_result=True
+    )
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -4729,6 +4744,9 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
+    @request_timeline.phase(
+        "scheduler_process_result", requests="batch", result_processing=True
+    )
     def process_batch_result(
         self,
         batch: ScheduleBatch,

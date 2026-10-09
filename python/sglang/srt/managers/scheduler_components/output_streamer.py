@@ -32,6 +32,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability import request_timeline
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -209,10 +210,14 @@ class SchedulerOutputStreamer:
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
-            if self.rust_server is not None:
-                self.rust_server.push_generation(payload)
-            else:
-                self.send_to_detokenizer.send_output(payload)
+
+            def send():
+                if self.rust_server is not None:
+                    self.rust_server.push_generation(payload)
+                else:
+                    self.send_to_detokenizer.send_output(payload)
+
+            request_timeline.stream_send(acc.output_reqs, acc.output_ids, send)
 
     def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
         """Return fields aligned with the emitted requests in ``reqs``.

@@ -49,7 +49,7 @@ from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.observability import cuda_request_profile
+from sglang.srt.observability import cuda_request_profile, request_timeline
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -266,7 +266,10 @@ class SchedulerBatchResultProcessor:
 
         if self.is_generation:
             if result.copy_done is not None:
-                result.copy_done.synchronize()
+                with request_timeline.batch_scope(
+                    batch, result, "scheduler_prefill_copy_wait"
+                ):
+                    result.copy_done.synchronize()
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
@@ -358,6 +361,7 @@ class SchedulerBatchResultProcessor:
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
+                        request_timeline.token_commit(req, 1)
 
                         self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -871,7 +875,10 @@ class SchedulerBatchResultProcessor:
         if not (is_decode or batch.forward_mode.is_extend()):
             return
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            with request_timeline.batch_scope(
+                batch, result, "scheduler_grammar_copy_wait"
+            ):
+                result.copy_done.synchronize()
         next_token_ids = result.next_token_ids.tolist()
 
         if not is_decode:
@@ -926,7 +933,10 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            with request_timeline.batch_scope(
+                batch, result, "scheduler_decode_copy_wait"
+            ):
+                result.copy_done.synchronize()
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
@@ -1015,6 +1025,7 @@ class SchedulerBatchResultProcessor:
                 new_accept_len = 0
             else:
                 req.output_ids.extend(next_token_id)
+                request_timeline.token_commit(req, len(next_token_id))
                 new_accept_len = len(next_token_id)
                 self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)

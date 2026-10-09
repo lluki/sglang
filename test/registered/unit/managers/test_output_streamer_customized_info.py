@@ -1,4 +1,7 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -91,6 +94,51 @@ def _accumulator(current_weight_version="default"):
 
 
 class TestOutputStreamerCustomizedInfo(unittest.TestCase):
+    def test_timeline_records_only_sent_ordinals_and_preserves_payload(self):
+        from sglang.srt.observability import request_timeline
+
+        outputs = []
+
+        class Streamer(SchedulerOutputStreamer):
+            def get_cached_tokens_details(self, req):
+                return None
+
+        streamer = Streamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
+            server_args=SimpleNamespace(),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+        )
+        emitted = _FakeReq("emitted", [991, 992])
+        emitted.stream = True
+        emitted.send_token_offset = 1
+        emitted._timeline_result_forward_id = "actual-forward"
+        skipped = _FakeReq("skipped", [993])
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            request_timeline, "_directory", directory
+        ):
+            streamer._stream_output_generation(
+                [emitted, skipped], False, skip_req=skipped
+            )
+            rows = [
+                json.loads(line)
+                for p in Path(directory).glob("*.jsonl")
+                for line in p.read_text().splitlines()
+            ]
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].output_ids, [[992]])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rid"], "emitted")
+        self.assertEqual(rows[0]["forward_id"], "actual-forward")
+        self.assertEqual(
+            (rows[0]["output_token_start"], rows[0]["output_token_end"]), (1, 2)
+        )
+        self.assertNotIn("992", json.dumps(rows))
+
     def setUp(self):
         serving_patch = patch(
             "sglang.srt.managers.scheduler_components.output_streamer.get_serving",

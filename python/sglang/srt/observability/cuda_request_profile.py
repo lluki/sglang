@@ -8,9 +8,11 @@ reach the request timeline. GPU clock probes synchronize their own stream;
 serving kernels and transfer streams retain their normal scheduling.
 """
 import contextlib
+import heapq
 import os
 import threading
 import time
+from collections import defaultdict
 
 from . import request_timeline
 
@@ -61,6 +63,7 @@ def start(rid):
             request_timeline.emit(rid, "cuda_activity_error",
                                   reason="another request profiler is active")
         return
+    started = time.monotonic_ns()
     import torch
     if not torch.cuda.is_available():
         request_timeline.emit(rid, "cuda_activity_error", reason="CUDA unavailable")
@@ -92,6 +95,10 @@ def start(rid):
         _current = None
         request_timeline.emit(rid, "cuda_activity_error",
                               reason=type(error).__name__)
+    finally:
+        request_timeline.emit(rid, "cuda_profile_setup", started, time.monotonic_ns(),
+                              category="framework_cpu", operation="DIAGNOSTIC",
+                              source="profiler startup and private-stream clock calibration")
 
 
 def scope(stage):
@@ -135,6 +142,31 @@ def select_events(events, anchors, probes):
         })
     annotations = [e for e in entries if "CPU" in e["device_type"] and e["name"].startswith("sglang:")]
     cpu = [e for e in entries if "CPU" in e["device_type"]]
+    by_correlation, by_external = defaultdict(list), defaultdict(list)
+    for entry in cpu:
+        if entry["correlation_id"]:
+            by_correlation[entry["correlation_id"]].append(entry)
+        if entry["external_id"]:
+            by_external[entry["external_id"]].append(entry)
+    annotations_by_thread = defaultdict(list)
+    for annotation in annotations:
+        annotations_by_thread[annotation["thread_id"]].append(annotation)
+    cpu_by_thread = defaultdict(list)
+    for entry in cpu:
+        cpu_by_thread[entry["thread_id"]].append(entry)
+    annotation_for_cpu = {}
+    for thread, thread_cpu in cpu_by_thread.items():
+        thread_annotations = sorted(annotations_by_thread[thread], key=lambda e: e["start_ns"])
+        active, position = [], 0
+        for entry in sorted(thread_cpu, key=lambda e: e["start_ns"]):
+            while position < len(thread_annotations) and thread_annotations[position]["start_ns"] <= entry["start_ns"]:
+                annotation = thread_annotations[position]
+                heapq.heappush(active, (annotation["end_ns"] - annotation["start_ns"], annotation["index"], annotation))
+                position += 1
+            while active and active[0][2]["end_ns"] <= entry["start_ns"]:
+                heapq.heappop(active)
+            if active:
+                annotation_for_cpu[entry["index"]] = active[0][2]
     selected = []
     retained_cpu = {}
     probe_events = {}
@@ -143,13 +175,11 @@ def select_events(events, anchors, probes):
             continue
         links = {event["correlation_id"], event["linked_correlation_id"]}
         links.discard(0)
-        launch = [e for e in cpu if e["correlation_id"] in links
-                  or (event["external_id"] and e["external_id"] == event["external_id"])]
-        containers = [
-            a for a in annotations if any(
-                a["thread_id"] == e["thread_id"]
-                and a["start_ns"] <= e["start_ns"] < a["end_ns"]
-                for e in launch)]
+        matches = {entry["index"]: entry for link in links for entry in by_correlation.get(link, ())}
+        if event["external_id"]:
+            matches.update((entry["index"], entry) for entry in by_external.get(event["external_id"], ()))
+        launch = sorted(matches.values(), key=lambda entry: entry["index"])
+        containers = [annotation_for_cpu[e["index"]] for e in launch if e["index"] in annotation_for_cpu]
         parent = min(containers, key=lambda a: a["end_ns"]-a["start_ns"]) if containers else None
         stage = parent["name"][7:] if parent else None
         gpu_envelope = event["name"].startswith("sglang:") or event["name"] in (
@@ -180,11 +210,18 @@ def select_events(events, anchors, probes):
             retained_cpu[parent["index"]] = dict(parent, category="framework_cpu", envelope=True,
                                                  joined_stage=stage, source="PyTorch named CPU annotation")
     calibrated = []
-    for event in retained_cpu.values():
-        event["envelope"] = event["envelope"] or any(
-            child["index"] != event["index"] and child["thread_id"] == event["thread_id"]
-            and event["start_ns"] <= child["start_ns"] and child["end_ns"] <= event["end_ns"]
-            for child in retained_cpu.values()) or "Synchronize" in event["name"] or "WaitEvent" in event["name"]
+    # Per-thread profiler scopes are nested; a sorted stack retains that
+    # hierarchy without comparing every CPU event with every other event.
+    stacks = defaultdict(list)
+    for event in sorted(retained_cpu.values(), key=lambda e: (e["thread_id"], e["start_ns"], -e["end_ns"], e["index"])):
+        stack = stacks[event["thread_id"]]
+        while stack and (stack[-1]["end_ns"] <= event["start_ns"] or stack[-1]["end_ns"] < event["end_ns"]):
+            stack.pop()
+        if stack:
+            stack[-1]["envelope"] = True
+            event["cpu_parent_index"] = stack[-1]["index"]
+        event["envelope"] = event["envelope"] or "Synchronize" in event["name"] or "WaitEvent" in event["name"]
+        stack.append(event)
     for probe in probes:
         gpu = probe_events.get(probe["label"], [])
         if not gpu:

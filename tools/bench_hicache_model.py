@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--receive-mode", choices=["native_direct", "native_staged"])
     parser.add_argument("--validation-attempts", type=int, default=1,
                         help="Bounded remote convergence attempts; failed setup rows are excluded")
+    parser.add_argument("--timeline-dir", help="Wait for diagnostic collection before admitting the next request")
     parser.add_argument("--replay-from", help="Prior requests.jsonl: reuse exact cold prompts/salts for remote-only hits")
     parser.add_argument("--contexts", type=int, nargs="+", default=[512, 1024, 2048])
     parser.add_argument("--repetitions", type=int, default=3)
@@ -79,6 +80,8 @@ def main():
     records = []
     request_number = 0
     measured = []
+    timeline_offsets = {}
+    collected = set()
     headers = {}
     if args.admin_key_file:
         headers["Authorization"] = "Bearer " + pathlib.Path(args.admin_key_file).read_text().strip()
@@ -103,6 +106,28 @@ def main():
             return None
         with urllib.request.urlopen(args.owner_url.rstrip("/") + "/stats", timeout=30) as response:
             return json.load(response)
+
+    def wait_for_collection(identifier):
+        if not args.timeline_dir:
+            return
+        deadline = time.monotonic() + 120
+        while identifier not in collected:
+            for path in pathlib.Path(args.timeline_dir).glob("request-timeline-*.jsonl"):
+                with path.open() as stream:
+                    stream.seek(timeline_offsets.get(path, 0))
+                    while True:
+                        position = stream.tell()
+                        line = stream.readline()
+                        if not line:break
+                        if not line.endswith("\n"):
+                            stream.seek(position);break
+                        if '"stage":"cuda_profile_collection"' in line:
+                            collected.add(json.loads(line)["rid"])
+                    timeline_offsets[path] = stream.tell()
+            if time.monotonic() >= deadline:
+                raise RuntimeError("diagnostic collection did not finish before next request admission")
+            if identifier not in collected:
+                time.sleep(.05)
 
     def accept(record, tier, repetition, expected):
         witnesses = verify_tier(record, tier, expected, args.page_size, args.receive_mode)
@@ -144,6 +169,7 @@ def main():
         ended = time.monotonic_ns()
         if first is None or final is None:
             raise RuntimeError(f"{label}: no nonempty first-token event")
+        wait_for_collection(identifier)
         # This wait is outside TTFT and allows asynchronous backups to finish.
         time.sleep(.5)
         after_raw, after = snapshot()

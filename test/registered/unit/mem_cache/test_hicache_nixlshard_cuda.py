@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU regressions for clock bounds and CUDA activity-to-request stage joins."""
 import unittest
+import time
 from unittest.mock import patch
 from sglang.srt.observability.cuda_request_profile import (
     anchor_offset_bounds, clock_probe_bounds, select_events,
@@ -80,6 +81,18 @@ class TestCUDARequestActivity(unittest.TestCase):
             stop.assert_not_called()
             profile.flush_completed()
             stop.assert_called_once_with("test-request")
+
+    def test_model_sized_correlations_and_cpu_hierarchy_have_bounded_collection_cost(self):
+        events = []
+        for i in range(10000):
+            begin = 100 * i
+            events.extend([event("sglang:model_prefill", begin, begin + 60),
+                           event("cudaLaunchKernel", begin + 10, begin + 20, corr=i + 1),
+                           event("kernel", begin + 25, begin + 30, "CUDA", corr=i + 1)])
+        started = time.monotonic()
+        selected, _ = select_events(events, [], [])
+        self.assertEqual(sum("CUDA" in e["device_type"] for e in selected), 10000)
+        self.assertLess(time.monotonic() - started, 3, "model-sized trace collection regressed to quadratic work")
 
 
 if __name__ == "__main__":

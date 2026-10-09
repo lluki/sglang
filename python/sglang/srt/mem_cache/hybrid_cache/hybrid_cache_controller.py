@@ -586,7 +586,9 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
-    ) -> int:
+    ) -> Optional[int]:
+        if not self.can_write_storage:
+            return None
         operation = StorageOperation(
             host_indices,
             token_ids,

@@ -5,6 +5,7 @@
 import copy
 import ctypes
 import logging
+import os
 import threading
 import time
 from collections import Counter, deque
@@ -47,7 +48,12 @@ class HiCacheNixlShard(HiCacheStorage):
 
         self.storage_config = storage_config
         self.model_revision = revision
-        self.native_config = copy.deepcopy(config)
+        # Provider/callback objects may own locks and must retain their identity.
+        self.native_config = {
+            key: value if callable(value) else copy.deepcopy(value)
+            for key, value in config.items()
+        }
+        self.write_enabled = bool(self.native_config.get("disks"))
         self.numa_node = config.get("numa_node", 0)
         self.direct_receive = config.get("direct_receive", False)
         self.build_marker = getattr(nixlshard, "__build_marker__", "unknown")
@@ -74,8 +80,6 @@ class HiCacheNixlShard(HiCacheStorage):
             raise ValueError("transfer_timeout_seconds must be positive")
         self.agent = nixlshard.Agent(self.native_config)
         try:
-            if "key_change_callback" in extra:
-                self.agent.set_key_change_callback(extra["key_change_callback"])
             for owner, endpoint in extra.get("peers", {}).items():
                 self.agent.add_peer(owner, endpoint)
         except BaseException:
@@ -101,14 +105,23 @@ class HiCacheNixlShard(HiCacheStorage):
     @staticmethod
     def _hints(extra_info, count, namespace):
         values = (extra_info.extra_info or {}) if extra_info else {}
-        hints = values.get("owner_hints")
+        if "owner_hints" in values:
+            raise ValueError("use location_hints lists instead of owner_hints")
+        hints = values.get("location_hints")
         if isinstance(hints, dict):
             hints = hints.get(namespace)
         if hints is None:
-            return [""] * count
-        if len(hints) != count or any(not isinstance(hint, str) for hint in hints):
-            raise ValueError("owner_hints must contain one owner string per page")
-        return list(hints)
+            return [[] for _ in range(count)]
+        if (
+            not isinstance(hints, list) or len(hints) != count
+            or any(
+                not isinstance(owners, list)
+                or any(not isinstance(owner, str) or not owner for owner in owners)
+                for owners in hints
+            )
+        ):
+            raise ValueError("location_hints must contain one list of owner strings per page")
+        return [list(owners) for owners in hints]
 
     @staticmethod
     def _tensor_buffers(pool):
@@ -246,7 +259,7 @@ class HiCacheNixlShard(HiCacheStorage):
             pages.append(ranges)
         return pages
 
-    def _wait(self, handle, items, extra_info):
+    def _wait(self, handle, items, extra_info, direction=None, batch_id=None):
         values = (extra_info.extra_info or {}) if extra_info else {}
         deadline = values.get("deadline_monotonic")
         if deadline is None and self._timeout is not None:
@@ -283,6 +296,7 @@ class HiCacheNixlShard(HiCacheStorage):
                 try:
                     request_timeline.emit(
                         request_id, "native_batch", batch_handle=handle,
+                        native_batch_id=batch_id, operation="GET" if direction == "get" else "PUT" if direction == "set" else None,
                         build_marker=self.build_marker, terminal_observed=True,
                         events=self.agent.trace(handle),
                     )
@@ -299,6 +313,8 @@ class HiCacheNixlShard(HiCacheStorage):
     def _transfer(self, keys, indices, direction, extra_info, name=PoolName.KV):
         namespace = str(name)
         native_keys = self._keys(keys)
+        if direction == "set" and native_keys and not self.write_enabled:
+            raise RuntimeError("NIXLShard storage writes require an assigned local SSD")
         if not keys:
             if indices is not None and indices.numel():
                 raise ValueError("empty keys have nonempty host indices")
@@ -310,8 +326,11 @@ class HiCacheNixlShard(HiCacheStorage):
             hints = self._hints(extra_info, len(keys), namespace)
             results = []
             started = time.perf_counter()
-            diagnostic_start_ns = time.monotonic_ns() if self._diagnostic_logging else 0
-            copies = Counter() if self._diagnostic_logging else None
+            tracing = self._diagnostic_logging or request_timeline.enabled()
+            diagnostic_start_ns = time.monotonic_ns() if tracing else 0
+            copies = Counter() if tracing else None
+            request_id = ((extra_info.extra_info or {}) if extra_info else {}).get("request_id")
+            transfer_id = f"{os.getpid()}:adapter:{diagnostic_start_ns}"
             for first in range(0, len(keys), min(STORAGE_BATCH_SIZE, 128)):
                 batch = pages[first:first + min(STORAGE_BATCH_SIZE, 128)]
                 begin = first * pool.page_size
@@ -321,6 +340,8 @@ class HiCacheNixlShard(HiCacheStorage):
                 )
                 packed = []
                 items = []
+                batch_id = f"{transfer_id}:batch:{first}"
+                layouts = []
                 try:
                     for index, ranges in enumerate(batch):
                         if not ranges:
@@ -342,11 +363,16 @@ class HiCacheNixlShard(HiCacheStorage):
                             packed.append((index, pointer, length, allocation, ranges))
                             if direction == "set":
                                 offset = 0
-                                copied_at = time.perf_counter_ns()
+                                copied_at = time.monotonic_ns()
                                 for source, size in ranges:
                                     ctypes.memmove(pointer + offset, source, size)
                                     offset += size
-                                copy_ns = time.perf_counter_ns() - copied_at
+                                copied_end = time.monotonic_ns()
+                                copy_ns = copied_end - copied_at
+                                request_timeline.emit(request_id, "framework_pack", copied_at, copied_end,
+                                                      category="framework_pack", operation="PUT", bytes=length,
+                                                      native_batch_id=batch_id, object_index=len(items),
+                                                      span_id=f"{batch_id}:pack:{len(items)}", parent_id=transfer_id)
                                 with self._condition:
                                     self._stats["pack_bytes"] += length
                                     self._stats["pack_ns"] += copy_ns
@@ -358,12 +384,23 @@ class HiCacheNixlShard(HiCacheStorage):
                             "buffer": (pointer, length, 0),
                         }
                         if direction == "get":
-                            item["hint"] = hints[first + index]
+                            item["location_hints"] = hints[first + index]
                         items.append(item)
+                        layouts.append({"object_index": len(items) - 1, "page_index": first + index,
+                                        "bytes": length, "destination_kind": "framework_pool" if contiguous else "registered_packed_buffer",
+                                        "framework_pool_direct_eligible": contiguous,
+                                        "component_bytes": [size for _, size in ranges],
+                                        "destination_alignment_mod4096": pointer % 4096,
+                                        "component_alignment_mod4096": [p % 4096 for p, _ in ranges]})
                     if items:
                         submit = self.agent.batch_load if direction == "get" else self.agent.batch_store
                         handle = submit(items)
-                        completed = self._wait(handle, items, extra_info)
+                        completed = self._wait(handle, items, extra_info, direction, batch_id)
+                        if request_id and tracing:
+                            request_timeline.emit(request_id, "receive_witness", native_batch_id=batch_id,
+                                                  operation="GET" if direction == "get" else "PUT",
+                                                  direct_receive=self.direct_receive,
+                                                  objects=[dict(layout, successful=success) for layout, success in zip(layouts, completed)])
                         physical = iter(completed)
                         batch_results = [next(physical) if ranges else True for ranges in batch]
                     else:
@@ -372,11 +409,17 @@ class HiCacheNixlShard(HiCacheStorage):
                         for index, pointer, length, allocation, ranges in packed:
                             if batch_results[index]:
                                 offset = 0
-                                copied_at = time.perf_counter_ns()
+                                copied_at = time.monotonic_ns()
                                 for destination, size in ranges:
                                     ctypes.memmove(destination, pointer + offset, size)
                                     offset += size
-                                copy_ns = time.perf_counter_ns() - copied_at
+                                copied_end = time.monotonic_ns()
+                                copy_ns = copied_end - copied_at
+                                object_index = next(layout["object_index"] for layout in layouts if layout["page_index"] == first + index)
+                                request_timeline.emit(request_id, "framework_unpack", copied_at, copied_end,
+                                                      category="framework_unpack", operation="GET", bytes=length,
+                                                      native_batch_id=batch_id, object_index=object_index,
+                                                      span_id=f"{batch_id}:unpack:{object_index}", parent_id=transfer_id)
                                 with self._condition:
                                     self._stats["unpack_bytes"] += length
                                     self._stats["unpack_ns"] += copy_ns
@@ -406,8 +449,7 @@ class HiCacheNixlShard(HiCacheStorage):
                 prefix = "prefetch" if direction == "get" else "backup"
                 self._metric_samples[f"{prefix}_pgs"].append(sum(results))
                 self._metric_samples[f"{prefix}_bandwidth"].append(transferred / elapsed / 1024**3)
-            if self._diagnostic_logging:
-                request_id = ((extra_info.extra_info or {}) if extra_info else {}).get("request_id")
+            if tracing:
                 fields = {key: copies[key] for key in (
                     "physical_components", "framework_pool_bytes", "packed_buffer_bytes",
                     "pack_bytes", "pack_ns", "unpack_bytes", "unpack_ns",
@@ -416,6 +458,7 @@ class HiCacheNixlShard(HiCacheStorage):
                             direction, namespace, len(results), sum(results), fields)
                 request_timeline.emit(request_id, "adapter_transfer", start_ns=diagnostic_start_ns,
                                       end_ns=time.monotonic_ns(), direction=direction, pool=namespace,
+                                      span_id=transfer_id, envelope=True, operation="GET" if direction == "get" else "PUT",
                                       pages=len(results), hits=sum(results), **fields)
             return results
 
@@ -435,10 +478,16 @@ class HiCacheNixlShard(HiCacheStorage):
         found = []
         for first in range(0, len(keys), 128):
             items = [
-                {"key": key, "namespace": namespace, "hint": hints[first + i]}
+                {"key": key, "namespace": namespace, "location_hints": hints[first + i]}
                 for i, key in enumerate(native_keys[first:first + 128])
             ]
+            started = time.monotonic_ns()
             current = self.agent.batch_exists(items)
+            request_id = ((extra_info.extra_info or {}) if extra_info else {}).get("request_id")
+            request_timeline.emit(request_id, "key_location", started, time.monotonic_ns(),
+                                  category="key_location", operation="EXISTS", objects=len(items),
+                                  found=sum(current), pool=namespace,
+                                  span_id=f"{os.getpid()}:exists:{started}")
             if len(current) != len(items):
                 raise RuntimeError("incomplete NIXLShard existence result")
             found.extend(current)

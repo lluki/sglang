@@ -36,12 +36,17 @@ The disk list is supplied unchanged to one Agent at construction. Its format
 limits must accommodate every physical pool's complete logical page. Registration
 records the configured NUMA hint; transfer descriptors contain no NUMA selector.
 
-Standalone discovery uses an Agent `metadata_endpoint` of
+Standalone discovery uses an Agent `metadata_provider` of
 `{"type": "etcd", "hosts": ["http://127.0.0.1:2379"]}`. Framework-managed
-inventory can supply an extra-configuration `key_change_callback`, a `peers`
+inventory can supply a constructor Agent configuration `key_change_callback`, a `peers`
 mapping of owner names to numeric IPv4/control-port endpoints, and
-`owner_hints` through `HiCacheStorageExtraInfo.extra_info`. Hints may be a list
-for one pool or a mapping from pool name to per-page lists.
+`location_hints` through `HiCacheStorageExtraInfo.extra_info`. Each page has a list
+of candidate owner names; a mapping can select different per-page lists by pool.
+An empty list delegates lookup to the configured metadata provider. A callable
+provider and callback retain their object identity and lifetime in the Agent.
+Diskless requesters retain prefetch but the serving controllers skip storage
+backup before protecting nodes or queuing writes. Other storage backends retain
+their existing write behavior.
 
 Every v2 pool uses exactly `namespace=str(transfer.name)`: `kv`, `swa`,
 `mamba`, `indexer`, and other registered pool names. The v1 methods use `kv`.
@@ -131,3 +136,17 @@ bytes/nanoseconds. Host registration logs actual component count and adjacency.
 The Qwen3 MHA host pool separates K/V even in `page_first_direct`; native direct
 receive into its owned packed buffer still requires framework-pool unpack copies
 and must not be reported as framework receiver zero-copy.
+Per-object timeline leaves distinguish framework packing/unpacking from native
+copies and identify GET versus PUT. Destination witnesses retain component
+lengths, contiguity and alignment without exporting addresses or cache keys.
+
+For diagnostic CUDA activity, set `SGLANG_REQUEST_CUDA_ACTIVITY=1` together with
+the timeline directory. One request per scheduler may be profiled at a time.
+CUPTI/Kineto absolute kernel and transfer timestamps are joined to named CPU
+launch annotations using correlation IDs. CPU wall/monotonic read brackets and
+before/after probe kernels retain measured clock bounds. Only the probe stream
+is synchronized for calibration; missing stage or clock joins remain explicit.
+Profiler startup and collection add overhead, so retain separate matched runs
+with diagnostics disabled. Cumulative native counters and parent envelopes are
+never substitutes for disjoint causal intervals ending at the client's first
+received nonempty text event.

@@ -49,6 +49,7 @@ from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.observability import cuda_request_profile
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -129,6 +130,7 @@ class SchedulerBatchResultProcessor:
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        cuda_request_profile.flush_completed()
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
@@ -481,6 +483,7 @@ class SchedulerBatchResultProcessor:
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
+        cuda_request_profile.flush_completed()
 
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and
@@ -1066,6 +1069,7 @@ class SchedulerBatchResultProcessor:
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+        cuda_request_profile.flush_completed()
 
         self.metrics_reporter.forward_ct_decode = (
             self.metrics_reporter.forward_ct_decode + 1

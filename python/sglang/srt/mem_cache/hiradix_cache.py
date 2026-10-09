@@ -931,6 +931,8 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(lock_node)
 
     def write_backup_storage(self, node: TreeNode, backup_len: Optional[int] = None):
+        if not self.cache_controller.can_write_storage:
+            return
         # Recover pre-split data via walk-and-concat if node was split.
         # prefix_keys anchored at chain top to avoid double-counting.
         if backup_len is None or len(node.key) == backup_len:
@@ -954,6 +956,8 @@ class HiRadixCache(RadixCache):
         operation_id = self.cache_controller.write_storage(
             host_value, key, hash_value, prefix_keys, **self._get_extra_pools()
         )
+        if operation_id is None:
+            return
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 

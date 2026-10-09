@@ -2,12 +2,15 @@
 """CPU contract tests for the whole-page NIXLShard public API adapter."""
 import ctypes
 import hashlib
+import json
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -179,6 +182,7 @@ def config(direct_receive=False, enable_storage_metrics=False, revision="immutab
         is_page_first_layout=True, model_name="model",
         extra_config={"model_revision": revision, "agent": {
             "name": "test", "numa_node": 3, "direct_receive": direct_receive,
+            "disks": [{"path": "/test/mock-file"}],
         }},
     )
 
@@ -222,6 +226,39 @@ class TestHiCacheNixlShard(unittest.TestCase):
                 counters = backend.get_stats()
                 self.assertEqual(counters.get("pack_bytes", 0), 256 if layout == "layer_first" else 0)
                 self.assertEqual(counters.get("unpack_bytes", 0), 256 if layout == "layer_first" else 0)
+
+    def test_request_joined_copy_leaves_and_layout_witnesses_are_address_free(self):
+        from sglang.srt.observability import request_timeline
+        pool = Pool("layer_first")
+        backend = self.backend(pool, direct_receive=True)
+        backend.native_config["enable_trace"] = True
+        extra = HiCacheStorageExtraInfo(extra_info={"request_id": "test-request"})
+        keys = page_keys("trace-a", "trace-b", "trace-c", "trace-d")
+        with tempfile.TemporaryDirectory() as directory, patch.object(request_timeline, "_directory", directory):
+            backend.batch_set_v1(keys, torch.arange(8), extra)
+            pool.zero()
+            backend.batch_get_v1(keys, torch.arange(8), extra)
+            rows = [json.loads(line) for path in Path(directory).glob("*.jsonl") for line in path.read_text().splitlines()]
+        leaves = [row for row in rows if row["stage"] in ("framework_pack", "framework_unpack")]
+        self.assertEqual(sum(row["bytes"] for row in leaves if row["operation"] == "GET"), 256)
+        self.assertEqual(sum(row["bytes"] for row in leaves if row["operation"] == "PUT"), 256)
+        for row in leaves:
+            self.assertEqual(row["rid"], "test-request")
+            self.assertLessEqual(row["start_ns"], row["end_ns"])
+            self.assertTrue(row["native_batch_id"])
+        batch_ids = {row["native_batch_id"] for row in rows if row["stage"] == "native_batch"}
+        self.assertEqual({row["native_batch_id"] for row in leaves}, batch_ids)
+        witnesses = [row for row in rows if row["stage"] == "receive_witness" and row["operation"] == "GET"]
+        self.assertEqual(len(witnesses), 1)
+        for obj in witnesses[0]["objects"]:
+            self.assertEqual(obj["destination_kind"], "registered_packed_buffer")
+            self.assertFalse(obj["framework_pool_direct_eligible"])
+            self.assertEqual(obj["component_bytes"], [32, 32])
+        encoded = json.dumps(rows)
+        for key in keys:
+            self.assertNotIn(key, encoded)
+        for address, _ in backend.agent.regions:
+            self.assertNotIn(str(address), encoded)
 
     def test_v2_pool_namespaces_preserve_same_ascii_key(self):
         backend = self.backend(Pool("layer_first"))
@@ -278,6 +315,47 @@ class TestHiCacheNixlShard(unittest.TestCase):
         backend.batch_set_v1(["whole-page"], torch.arange(2))
         self.assertEqual(backend.agent.registrations[-1][4], 3)
         self.assertFalse(backend.mem_pool_host.leases)
+
+    def test_location_hint_candidates_are_per_page_lists(self):
+        backend = self.backend()
+        info = HiCacheStorageExtraInfo(extra_info={"location_hints": [["owner-a", "owner-b"], []]})
+        backend.batch_get_v1(["one", "two"], torch.arange(4), info)
+        items = backend.agent.submissions[-1][1]
+        self.assertEqual(items[0]["location_hints"], ["owner-a", "owner-b"])
+        self.assertEqual(items[1]["location_hints"], [])
+        self.assertNotIn("hint", items[0])
+        with self.assertRaises(ValueError):
+            backend.batch_exists(["one"], HiCacheStorageExtraInfo(extra_info={"location_hints": ["owner"]}))
+
+    def test_diskless_requester_prefetches_without_admitting_storage_writes(self):
+        storage = config()
+        storage.extra_config["agent"]["disks"] = []
+        pool = Pool()
+        backend = StorageBackendFactory.create_backend("nixlshard", storage, pool)
+        self.backends.append(backend)
+        backend.register_mem_pool_host(pool)
+        backend.agent.values[("kv", b"page")] = pool.bytes()[0][:64]
+        self.assertFalse(backend.write_enabled)
+        self.assertEqual(backend.batch_get_v1(["page"], torch.arange(2)), [True])
+        with self.assertRaisesRegex(RuntimeError, "assigned local SSD"):
+            backend.batch_set_v1(["page"], torch.arange(2))
+        self.assertEqual([direction for direction, _ in backend.agent.submissions], ["get"])
+
+    def test_constructor_preserves_callable_provider_and_callback_identity(self):
+        class Callback:
+            def __init__(self):
+                self.lock = threading.Lock()
+            def __call__(self, events):
+                return []
+        callback = Callback()
+        storage = config()
+        storage.extra_config["agent"].update(metadata_provider=callback, key_change_callback=callback)
+        pool = Pool()
+        backend = StorageBackendFactory.create_backend("nixlshard", storage, pool)
+        self.backends.append(backend)
+        backend.register_mem_pool_host(pool)
+        self.assertIs(backend.agent.config["metadata_provider"], callback)
+        self.assertIs(backend.agent.config["key_change_callback"], callback)
 
     def test_deadline_cancels_then_drains_before_leases_or_buffers_return(self):
         backend = self.backend(Pool("layer_first"), direct_receive=True)

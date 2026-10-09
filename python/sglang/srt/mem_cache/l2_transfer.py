@@ -5,6 +5,7 @@ from functools import cache
 from typing import Any, Callable, NamedTuple, Optional
 
 import torch
+from sglang.srt.observability import cuda_request_profile
 
 from sglang.srt.utils import get_device_module
 
@@ -57,7 +58,7 @@ class L2TransferEngine:
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        with device_module.stream(self.device_to_host_stream):
+        with cuda_request_profile.scope("d2h_backup"), device_module.stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
             ack_start.record()
             for transfer in transfers:
@@ -82,7 +83,7 @@ class L2TransferEngine:
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         primary = transfers[0] if transfers else None
-        with device_module.stream(self.host_to_device_stream):
+        with cuda_request_profile.scope("h2d"), device_module.stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
             for layer_id in range(layer_num):

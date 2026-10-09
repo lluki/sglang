@@ -17,6 +17,40 @@ import urllib.request
 import uuid
 
 
+def verify_tier(record, tier, expected, page_size, receive_mode=None):
+    """Reject partial/mixed cache paths and mismatched deterministic outputs."""
+    if record["text"] != expected:
+        raise RuntimeError(f"{tier}: output differs from full recomputation")
+    length = record["context_tokens"]
+    cache = record["meta_info"].get("cached_tokens_details") or {}
+    delta = record["native_bytes_delta_full_generation_background"]
+    source = {"hot_gpu": "device", "warm_host": "host", "warm_local_ssd": "storage", "warm_remote_ssd": "storage"}.get(tier)
+    if tier == "cold":
+        if record["meta_info"].get("cached_tokens", 0) or any(cache.values()):
+            raise RuntimeError("cold recomputation contains cache hits")
+    else:
+        if cache.get(source, 0) < length - page_size:
+            raise RuntimeError(f"{tier}: insufficient positive tier witness: {cache}")
+        if any(cache.get(other, 0) for other in {"device", "host", "storage"} - {source}):
+            raise RuntimeError(f"{tier}: mixed cache source: {cache}")
+    if tier == "warm_local_ssd" and (delta.get("posix_read", 0) <= 0 or delta.get("remote_read", 0)):
+        raise RuntimeError(f"local SSD payload witness missing: {delta}")
+    if tier == "warm_remote_ssd":
+        remote = delta.get("remote_read", 0)
+        direct = delta.get("direct_receive", 0)
+        if remote <= 0 or delta.get("posix_read", 0):
+            raise RuntimeError(f"remote payload witness missing or local payload present: {delta}")
+        if receive_mode == "native_direct" and direct != remote:
+            raise RuntimeError("successful remote GET bytes lack a complete native direct receive witness")
+        if receive_mode == "native_staged" and direct:
+            raise RuntimeError("staged receive unexpectedly contains direct GET bytes")
+        owner = record.get("owner_stats_delta_full_generation_background")
+        if owner is not None and (owner.get("posix_read_bytes", 0) != remote or owner.get("ssd_metadata_read_bytes", 0) <= 0):
+            raise RuntimeError("remote GET lacks matched positive owner payload/SSD metadata witnesses")
+    return {"exact_output_match": True, "exclusive_tier_verified": True,
+            "cache": cache, "semantic_answer_verified": expected.lstrip().startswith("4")}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:19400")
@@ -24,6 +58,10 @@ def main():
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--admin-key-file")
+    parser.add_argument("--owner-url", help="Read-only counter HTTP endpoint for the isolated SSD owner")
+    parser.add_argument("--receive-mode", choices=["native_direct", "native_staged"])
+    parser.add_argument("--validation-attempts", type=int, default=1,
+                        help="Bounded remote convergence attempts; failed setup rows are excluded")
     parser.add_argument("--replay-from", help="Prior requests.jsonl: reuse exact cold prompts/salts for remote-only hits")
     parser.add_argument("--contexts", type=int, nargs="+", default=[512, 1024, 2048])
     parser.add_argument("--repetitions", type=int, default=3)
@@ -40,6 +78,7 @@ def main():
     run = uuid.uuid4().hex
     records = []
     request_number = 0
+    measured = []
     headers = {}
     if args.admin_key_file:
         headers["Authorization"] = "Bearer " + pathlib.Path(args.admin_key_file).read_text().strip()
@@ -59,22 +98,39 @@ def main():
                     counters[key] = counters.get(key, 0) + float(line.rsplit(" ", 1)[1])
         return raw, counters
 
+    def owner_snapshot():
+        if not args.owner_url:
+            return None
+        with urllib.request.urlopen(args.owner_url.rstrip("/") + "/stats", timeout=30) as response:
+            return json.load(response)
+
+    def accept(record, tier, repetition, expected):
+        witnesses = verify_tier(record, tier, expected, args.page_size, args.receive_mode)
+        row = {key: value for key, value in record.items() if key not in {"cache_salt", "input_ids", "events"}}
+        row.update(repetition=repetition, receive_mode=args.receive_mode,
+                   clock_domain="requester:CLOCK_MONOTONIC", output_witnesses=witnesses,
+                   accepted=True)
+        with (output / "measured-samples.jsonl").open("a") as stream:
+            stream.write(json.dumps(row) + "\n")
+        measured.append(row)
+
     def generate(tokens, salt, label):
         nonlocal request_number
         request_number += 1
         identifier = f"{run}-{request_number}"
         before_raw, before = snapshot()
+        owner_before = owner_snapshot()
         payload = {"input_ids": tokens, "cache_salt": salt, "stream": True, "rid": identifier,
                    "sampling_params": {"temperature": 0, "max_new_tokens": 4, "ignore_eos": True}}
         request = urllib.request.Request(args.url + "/generate", data=json.dumps(payload).encode(),
                                          headers={"Content-Type": "application/json", **headers})
-        started = time.perf_counter_ns()
+        started = time.monotonic_ns()
         first = None
         events = []
         final = None
         with urllib.request.urlopen(request, timeout=300) as response:
             for line in response:
-                received = time.perf_counter_ns()
+                received = time.monotonic_ns()
                 if not line.startswith(b"data:"):
                     continue
                 body = line[5:].strip()
@@ -85,12 +141,13 @@ def main():
                 final = event
                 if first is None and event.get("text"):
                     first = received
-        ended = time.perf_counter_ns()
+        ended = time.monotonic_ns()
         if first is None or final is None:
             raise RuntimeError(f"{label}: no nonempty first-token event")
         # This wait is outside TTFT and allows asynchronous backups to finish.
         time.sleep(.5)
         after_raw, after = snapshot()
+        owner_after = owner_snapshot()
         info = final["meta_info"]
         record = {"request_id": identifier, "label": label, "context_tokens": len(tokens),
                   "cache_salt": salt, "input_ids": tokens, "ttft_ns": first-started, "generation_ns": ended-started,
@@ -98,6 +155,14 @@ def main():
                   "text": final["text"], "meta_info": info, "events": events,
                   "native_bytes_delta_full_generation_background": {
                       key: after.get(key, 0)-before.get(key, 0) for key in set(before) | set(after)}}
+        if owner_before is not None:
+            old, new = owner_before["stats"], owner_after["stats"]
+            record["owner_build_marker"] = owner_after["build_marker"]
+            record["owner_stats_delta_full_generation_background"] = {
+                key: new.get(key, 0) - old.get(key, 0) for key in set(old) | set(new)
+                if isinstance(new.get(key, 0), (int, float)) and isinstance(old.get(key, 0), (int, float))}
+            (output / f"{identifier}-owner-before.json").write_text(json.dumps(owner_before))
+            (output / f"{identifier}-owner-after.json").write_text(json.dumps(owner_after))
         (output / f"{identifier}-metrics-before.prom").write_text(before_raw)
         (output / f"{identifier}-metrics-after.prom").write_text(after_raw)
         records.append(record)
@@ -152,17 +217,22 @@ def main():
                 raise RuntimeError(f"no exact cold prompt/salt reference for context {length}")
             reference = candidates[-1]
             for repetition in range(args.repetitions):
-                flush()
-                record = generate(reference["input_ids"], reference["cache_salt"], "warm_remote_ssd")
-                cache = record["meta_info"].get("cached_tokens_details") or {}
-                delta = record["native_bytes_delta_full_generation_background"]
-                if record["text"] != reference["text"]:
-                    raise RuntimeError("remote output differs from full recomputation")
-                if cache.get("storage", 0) < length-args.page_size or cache.get("device", 0) or cache.get("host", 0):
-                    raise RuntimeError(f"remote tier has no full storage witness: {cache}")
-                if delta.get("remote_read", 0) <= 0 or delta.get("posix_read", 0):
-                    raise RuntimeError(f"remote payload witness missing or local payload present: {delta}")
-        summarize(records, args, output)
+                for attempt in range(args.validation_attempts):
+                    flush()
+                    record = generate(reference["input_ids"], reference["cache_salt"], "warm_remote_ssd")
+                    try:
+                        accept(record, "warm_remote_ssd", repetition, reference["text"])
+                    except RuntimeError as error:
+                        with (output / "excluded-setup.jsonl").open("a") as stream:
+                            stream.write(json.dumps({"request_id": record["request_id"], "context_tokens": length,
+                                                     "repetition": repetition, "attempt": attempt,
+                                                     "reason": str(error), "accepted": False}) + "\n")
+                        if attempt + 1 == args.validation_attempts:
+                            raise
+                        time.sleep(1)
+                    else:
+                        break
+        summarize(measured, args, output)
         return
     if "warm_remote_ssd" in args.tiers:
         parser.error("remote-only measurements require --replay-from")
@@ -186,6 +256,8 @@ def main():
             if not reference["text"].lstrip().startswith("4"):
                 raise RuntimeError("semantic output correctness failed")
             references.append(reference["text"])
+            if "cold" in args.tiers:
+                accept(reference, "cold", repetition, reference["text"])
         if len(set(references)) != 1:
             raise RuntimeError("deterministic cold outputs disagree")
         expected = references[-1]
@@ -197,21 +269,9 @@ def main():
                 elif tier == "warm_local_ssd":
                     flush()
                 record = generate(tokens, salt, tier)
-                if record["text"] != expected:
-                    raise RuntimeError(f"{tier}: output differs from full recomputation")
-                cache = record["meta_info"].get("cached_tokens_details") or {}
-                source = {"hot_gpu": "device", "warm_host": "host", "warm_local_ssd": "storage"}[tier]
-                if cache.get(source, 0) < length-args.page_size:
-                    raise RuntimeError(f"{tier}: insufficient positive tier witness: {cache}")
-                for other in {"device", "host", "storage"} - {source}:
-                    if cache.get(other, 0):
-                        raise RuntimeError(f"{tier}: mixed cache source: {cache}")
-                if tier == "warm_local_ssd":
-                    delta = record["native_bytes_delta_full_generation_background"]
-                    if delta.get("posix_read", 0) <= 0 or delta.get("remote_read", 0) != 0:
-                        raise RuntimeError(f"local SSD payload witness missing: {delta}")
+                accept(record, tier, repetition, expected)
 
-    summarize(records, args, output)
+    summarize(measured, args, output)
 
 
 def summarize(records, args, output):

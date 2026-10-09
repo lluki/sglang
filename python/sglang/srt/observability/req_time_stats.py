@@ -25,7 +25,7 @@ from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.observability import request_timeline
+from sglang.srt.observability import cuda_request_profile, request_timeline
 from sglang.srt.observability.metrics_collector import (
     EncoderMetricsCollector,
     SchedulerMetricsCollector,
@@ -443,6 +443,8 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def set_tokenize_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.tokenize_finish_time = ts
+        request_timeline.emit(self.timeline_rid, "api_tokenize", int(self.created_time * 1e9),
+                              int(ts * 1e9), category="framework_cpu")
 
         # tokenize span was started in set_created_time(); end it here.
         if self.trace_ctx.tracing_enable:
@@ -466,6 +468,8 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def set_api_server_dispatch_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.api_server_dispatch_finish_time = ts
+        request_timeline.emit(self.timeline_rid, "api_dispatch", int(self.api_server_dispatch_time * 1e9),
+                              int(ts * 1e9), category="framework_cpu")
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_slice_end(
@@ -672,6 +676,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
         request_timeline.emit(self.timeline_rid, "scheduler_received", int(ts * 1e9))
+        cuda_request_profile.start(self.timeline_rid)
 
     def set_spec_draft_start_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -719,6 +724,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_run_batch_cpu_end_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
         if self.run_batch_cpu_start_time > 0.0:
+            request_timeline.emit(self.timeline_rid, "run_batch_cpu",
+                                  int(self.run_batch_cpu_start_time * 1e9), int(ts * 1e9),
+                                  category="framework_cpu", envelope=True)
             self.trace_slice(
                 RequestStage.RUN_BATCH_CPU, self.run_batch_cpu_start_time, ts, attrs
             )
@@ -916,6 +924,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_completion_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.completion_time = ts
+        request_timeline.emit(self.timeline_rid, "scheduler_completion", int(ts * 1e9))
+        cuda_request_profile.mark_completed(self.timeline_rid)
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.abort()

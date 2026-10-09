@@ -81,7 +81,7 @@ class TestNativeHiCacheNixlShard(unittest.TestCase):
                 reader_pool.zero()
                 reader = self.backend(reader_pool, self.directory(), disks=[], direct_receive=direct)
                 reader.agent.add_peer(owner_name, owner.agent.endpoint())
-                info = HiCacheStorageExtraInfo(extra_info={"owner_hints": [owner_name] * 4})
+                info = HiCacheStorageExtraInfo(extra_info={"location_hints": [[owner_name] for _ in range(4)]})
                 deadline = time.monotonic() + 10
                 while reader.batch_exists(keys, info) != 4:
                     self.assertLess(time.monotonic(), deadline)

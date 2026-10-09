@@ -1275,16 +1275,24 @@ class HiCacheController:
             except Empty:
                 continue
 
+    @property
+    def can_write_storage(self) -> bool:
+        # A diskless NIXLShard requester supports prefetch only. Do not enqueue
+        # backups or acknowledge pages as persistent when no owner can store them.
+        return self.enable_storage and getattr(self.storage_backend, "write_enabled", True)
+
     def write_storage(
         self,
         host_indices: torch.Tensor,
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
-    ) -> int:
+    ) -> Optional[int]:
         """
         Write KV caches from host memory to storage backend.
         """
+        if not self.can_write_storage:
+            return None
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )

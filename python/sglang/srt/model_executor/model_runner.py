@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
+from sglang.srt.observability import cuda_request_profile
 import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
@@ -1726,6 +1727,9 @@ class ModelRunner:
         )
 
         with (
+            cuda_request_profile.scope(
+                "model_prefill" if forward_batch.forward_mode.is_extend() else "model_decode"
+            ),
             canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
